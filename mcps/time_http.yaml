@@ -1,0 +1,5 @@
+name: time_http
+transport: streamable-http
+enabled: false
+timeout: 30
+url: http://127.0.0.1:8002/mcp

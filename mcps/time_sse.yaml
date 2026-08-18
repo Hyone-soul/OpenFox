@@ -1,0 +1,5 @@
+name: time_sse
+transport: sse
+enabled: false
+timeout: 30
+url: http://127.0.0.1:8002/sse

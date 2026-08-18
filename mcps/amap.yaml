@@ -1,0 +1,7 @@
+name: amap
+transport: streamable-http
+url: https://mcp.amap.com/mcp?key=7dc6837c714dd8558c75d7146b9a0848
+enabled: true
+timeout: 30
+tool_allowlist: []
+tool_denylist: []

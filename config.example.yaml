@@ -1,0 +1,65 @@
+﻿# OpenFox 框架配置示例
+# 复制为 config.yaml 后修改
+#
+# 注意：旧的 config.yaml 内联 MCP 段已废弃。请改用 ./mcps/<name>.yaml 拆分文件，
+# 可运行 `python scripts/migrate_mcp_config.py` 从历史 config.yaml 一键迁移。
+
+skills_dir: ./skills
+workspace_dir: ./workspace
+logs_dir: ./logs
+
+# Agent 主循环（默认单轮最大工具调用步数）
+max_agent_steps: 500
+script_default_timeout: 30
+mcp_call_timeout: 60
+
+# 模型列表（可配置多个，运行时通过 /model 切换）
+models:
+  - name: gpt-4o
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    model: gpt-4o
+
+# 存储后端：memory | json | mysql
+storage:
+  backend: memory
+  json_dir: ./data/sessions
+  mysql_url: mysql+pymysql://user:pass@localhost/openfox
+
+# MCP 服务器请改用 ./mcps/<name>.yaml 拆分文件
+# 详见 README.md 的「自定义工具扩展」章节
+
+# 智能体配置（可通过 Web 端管理，此文件仅为默认示例）
+# tools / skills 为空列表 = 启用全部；指定则只启用列出的
+agents:
+  - id: default-assistant
+    name: 默认助手
+    description: 通用助手
+    model: gpt-4o
+    system_prompt: ""
+    tools: []
+    skills: []
+    temperature: 0.7
+    max_steps: 500
+
+# Skill 自我进化系统
+skill_evolution:
+  enabled: true
+  require_confirmation: true
+  min_failures: 2
+  min_repeats: 2
+  cooldown_turns: 20
+  data_dir: ./data/evolution
+
+# 上下文压缩（三层防御：预防 → 压缩 → 兜底）
+# 当对话历史超过阈值时自动触发压缩，保留头部+尾部，中间生成结构化摘要
+compression:
+  enabled: true
+  threshold: 0.5            # 触发阈值 = 有效输入预算 × 0.5
+  target_ratio: 0.2         # 压缩目标 = 有效输入预算 × 0.2
+  protect_first_n: 3        # 保护头部 N 条消息（system + 最初几轮）
+  protect_last_n: 20        # 保护尾部 N 条消息（最近上下文）
+  max_attempts: 3           # 最大压缩重试次数
+  anti_thrash_threshold: 0.1  # 反抖动：连续两次压缩收益 <10% 则熔断
+  cooldown_seconds: 30      # 压缩失败冷却期（秒）
+  # context_window: 64000   # 手动指定上下文窗口（不设则自动检测模型对应窗口）

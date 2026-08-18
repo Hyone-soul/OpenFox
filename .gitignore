@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+
+# Build / dist
+build/
+dist/
+
+# Runtime data
+logs/*.log
+data/sessions/
+data/usage/
+
+# Secrets
+.env
+config.yaml
+
+# Workspace (user files, keep .gitkeep)
+workspace/*
+!workspace/.gitkeep
+
+# Temp
+.temp/
+
+# Desktop (Electron)
+desktop/node_modules/
+desktop/dist/
+desktop/package-lock.json
+
+# Web (Vue)
+web/node_modules/
+web/dist/
+web/package-lock.json
+
+# Skills node_modules
+skills/**/node_modules/
+
+# Package lock (desktop)
+desktop/package-lock.json
+
+# IDE
+.vscode/
+.idea/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyInstaller
+*.spec
+
+# OpenFox memory (auto-generated, not for git)
+OPENFOX.md

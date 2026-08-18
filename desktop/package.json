@@ -1,0 +1,104 @@
+{
+  "name": "openfox-desktop",
+  "version": "1.0.0",
+  "description": "OpenFox Desktop Application - Agent Skills Framework",
+  "main": "main.js",
+  "author": "openfox",
+  "license": "MIT",
+  "scripts": {
+    "dev": "concurrently -k -n WEB,ELECTRON -c cyan,magenta \"npm run dev:web\" \"npm run dev:electron\"",
+    "dev:web": "cd ../web && npm run dev",
+    "dev:electron": "wait-on tcp:5173 && cross-env ELECTRON_DEV=true electron .",
+    "build": "npm run build:web && npm run build:electron",
+    "build:web": "cd ../web && npm run build:electron",
+    "build:backend": "python -m PyInstaller ../scripts/pack_backend.spec --clean --noconfirm",
+    "build:electron": "electron-builder --win",
+    "build:dir": "npm run build:web && electron-builder --win --dir",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.openfox.desktop",
+    "productName": "OpenFox",
+    "copyright": "Copyright © 2026 OpenFox",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "splash.html",
+      "backend.js",
+      "tray.js",
+      "menu.js",
+      "updater.js",
+      "window-state.js",
+      "assets/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../web/dist",
+        "to": "web"
+      },
+      {
+        "from": "../skills",
+        "to": "skills"
+      },
+      {
+        "from": "../tools",
+        "to": "tools"
+      },
+      {
+        "from": "../mcps",
+        "to": "mcps"
+      },
+      {
+        "from": "../scripts/config.release.yaml",
+        "to": "config.yaml"
+      },
+      {
+        "from": "../dist/openfox-backend.exe",
+        "to": "backend/openfox-backend.exe"
+      }
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "OpenFox-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "OpenFox",
+      "installerLanguages": [
+        "zh_CN"
+      ],
+      "language": "2052"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "openfox",
+      "repo": "openfox-desktop"
+    }
+  }
+}

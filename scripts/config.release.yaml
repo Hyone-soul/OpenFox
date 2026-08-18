@@ -1,0 +1,31 @@
+skills_dir: ./skills
+workspace_dir: ./workspace
+logs_dir: ./logs
+max_agent_steps: 500
+script_default_timeout: 30
+mcp_call_timeout: 60
+models:
+- name: deepseek-v4-flash
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  model: deepseek-v4-flash
+- name: 电信-deepseek-v4-flash
+  base_url: https://aigw.telecomjs.com/v1
+  model: deepseek-v4-flash
+  api_key_env: TELECOM_API_KEY
+  temperature: null
+  max_tokens: null
+  retry_count: null
+- name: 电信-deepseek-v4-pro
+  base_url: https://aigw.telecomjs.com/v1
+  model: deepseek-v4-pro
+  api_key_env: TELECOM_API_KEY
+  temperature: null
+  max_tokens: null
+  retry_count: null
+storage:
+  backend: memory
+  json_dir: ./data/sessions
+  mysql_url: ""
+mcp_servers: []
+active_model: deepseek-v4-flash

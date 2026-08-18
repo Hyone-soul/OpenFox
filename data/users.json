@@ -1,0 +1,14 @@
+{
+  "Ciel": {
+    "username": "Ciel",
+    "password_hash": "ec70553e12424bfdb11e1d9afec1cb63d5335b523d8e07cc49a8e359cd250bae",
+    "display_name": "黄勇",
+    "created_at": "2026-08-18T02:03:54.410928+00:00"
+  },
+  "CHX": {
+    "username": "CHX",
+    "password_hash": "ec70553e12424bfdb11e1d9afec1cb63d5335b523d8e07cc49a8e359cd250bae",
+    "display_name": "CHX",
+    "created_at": "2026-08-18T03:27:56.497526+00:00"
+  }
+}

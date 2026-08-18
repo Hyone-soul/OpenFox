@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 问题与帮助
+    url: https://github.com/jnMetaCode/superpowers-zh/discussions
+    about: 使用问题、故障排除和一般讨论，请访问 Discussions 而不是开 issue。

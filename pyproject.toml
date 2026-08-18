@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openfox"
+version = "0.1.0"
+description = "OpenFox - 自研 Agent Skills 框架 MVP（吉祥物：⚡）"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "watchdog>=4.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "python-dotenv>=1.0",
+    "prompt_toolkit>=3.0",
+    "rich>=13.0",
+    "openpyxl>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-httpx>=0.30",
+    "respx>=0.21",
+    "ruff>=0.4",
+]
+mysql = ["SQLAlchemy>=2.0", "PyMySQL>=1.1"]
+
+[project.scripts]
+openfox = "open_fox.cli:main"
+openfox-server = "open_fox.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,5 @@
+name: time_stdio
+transport: stdio
+command: C:\Software\miniconda\python.exe C:\Users\ASUS\Desktop\liaoyuan\day08\mcp_demos\stdio_server.py
+enabled: false
+timeout: 30

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    name: Validate skills and structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Count skills
+        run: |
+          TOTAL=$(ls -d skills/*/ 2>/dev/null | wc -l)
+          echo "Total skills: $TOTAL"
+          ls -d skills/*/
+
+      - name: Validate skill frontmatter
+        run: |
+          ERRORS=0
+          for dir in skills/*/; do
+            SKILL_FILE="${dir}SKILL.md"
+            if [ ! -f "$SKILL_FILE" ]; then
+              echo "::error::Missing SKILL.md in $dir"
+              ERRORS=$((ERRORS + 1))
+              continue
+            fi
+
+            # Check frontmatter exists
+            if ! head -1 "$SKILL_FILE" | grep -q '^---'; then
+              echo "::error file=$SKILL_FILE::Missing frontmatter"
+              ERRORS=$((ERRORS + 1))
+              continue
+            fi
+
+            # Check required fields
+            FRONTMATTER=$(sed -n '1,/^---$/p' "$SKILL_FILE" | tail -n +2)
+            for field in name description; do
+              if ! echo "$FRONTMATTER" | grep -q "^${field}:"; then
+                echo "::error file=$SKILL_FILE::Missing required field: $field"
+                ERRORS=$((ERRORS + 1))
+              fi
+            done
+          done
+
+          if [ $ERRORS -gt 0 ]; then
+            echo "::error::$ERRORS validation error(s) found"
+            exit 1
+          fi
+          echo "All skills validated successfully"
+
+      - name: Check package.json
+        run: |
+          node -e "
+            const pkg = JSON.parse(require('fs').readFileSync('package.json', 'utf8'));
+            const required = ['name', 'version', 'description', 'license'];
+            const missing = required.filter(f => !pkg[f]);
+            if (missing.length) {
+              console.error('Missing package.json fields:', missing.join(', '));
+              process.exit(1);
+            }
+            console.log('package.json OK:', pkg.name, 'v' + pkg.version);
+          "
+
+      - name: Validate install script
+        run: node bin/superpowers-zh.js --help
