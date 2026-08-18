@@ -17,6 +17,7 @@ OpenAI Chat Completions 兼容 API（让 openai-python 等客户端可直接调�
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -465,32 +466,33 @@ class ChatResponse(BaseModel):
     auto_title: str | None = None
 
 
-def _generate_auto_title(session) -> str | None:
-    """为首轮会话自动生成标题（过滤压缩摘要消息）。
+async def _generate_llm_title(adapter, user_message: str, session) -> str | None:
+    """用 LLM 把首条用户消息凝练为简短标题。
 
-    当标题仍为默认值且仅有 1 条真实用户消息（排除上下文压缩插入的
-    ``role="user"`` 摘要/锚点消息）时，取该消息前 20 字作为标题。
-
-    Returns:
-        生成的标题字符串；若不满足条件则返回 None。
+    若 LLM 调用失败或超时，降级为前 20 字截取，保证不影响主流程。
     """
-    meta = session.get_meta()
-    if meta.get("title", "") not in ("新会话", ""):
-        return None
-
-    # 过滤掉压缩摘要/锚点消息，只统计真实用户消息
-    real_user_msgs = [
-        m for m in session.chat_messages()
-        if m.get("role") == "user" and not m.get("_compressed")
-    ]
-    if len(real_user_msgs) != 1:
-        return None
-
-    first_user_msg = real_user_msgs[0].get("content", "")
-    if not first_user_msg:
-        return None
-
-    clean = first_user_msg.replace("\n", " ").strip()
+    prompt = (
+        "请把以下用户提问凝练为一个简短的对话标题（10-20字，不带引号，不加标题前缀）：\n\n"
+        f"{user_message[:500]}"
+    )
+    try:
+        resp = await asyncio.wait_for(
+            adapter.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            ),
+            timeout=15,
+        )
+        title = (resp.content or "").strip().replace("\n", " ")[:20]
+        if title:
+            logger.info("LLM 标题生成成功: %s", title)
+            session.set_meta(title=title)
+            session.save()
+            return title
+    except Exception as e:
+        logger.warning("LLM 标题生成失败，降级截取: %s", e)
+    # 降级：前 20 字截取
+    clean = user_message.replace("\n", " ").strip()
     title = clean[:20]
     if len(clean) > 20:
         title += "…"
@@ -581,8 +583,10 @@ async def chat(request: Request, req: ChatRequest) -> ChatResponse:
             session_id=req.session_id,
         )
 
-        # 自动标题：首轮会话从消息内容生成简短标题（过滤压缩摘要）
-        auto_title = _generate_auto_title(session)
+        # 自动标题：首轮会话用 LLM 凝练标题
+        auto_title = None
+        if session.get_meta().get("title", "") in ("新会话", ""):
+            auto_title = await _generate_llm_title(adapter, req.message, session)
 
         # 显式 dump 保证所有字段都被序列化（pydantic 默认 exclude_unset 会过滤）
         return ChatResponse(
@@ -700,6 +704,20 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
 
             loop_task = asyncio.create_task(run_loop())
 
+            # 异步生成标题（仅首轮），不阻塞主流程
+            # 注意：loop_task 此时还未实际执行（需等 await），session 中尚无 user 消息，
+            # 所以直接用 req.message 作为首条消息判断，不走 _should_generate_title
+            title_task = None
+            _meta = session.get_meta()
+            if _meta.get("title", "") in ("新会话", ""):
+                _first_msg = req.message
+                _title_adapter = adapter
+                async def _gen_title_task():
+                    title = await _generate_llm_title(_title_adapter, _first_msg, session)
+                    if title:
+                        await event_queue.put(("title_updated", {"title": title}))
+                title_task = asyncio.create_task(_gen_title_task())
+
             # 持续从队列读取事件，推送到 SSE
             # 双重保护机制：
             # 1. keepalive 心跳：每 15 秒无真实事件时发送 SSE 注释行（`: keepalive\n\n`），
@@ -734,9 +752,21 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
                         break
                     continue
 
+                if event_type == "title_updated":
+                    yield f"event: title_updated\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                    continue
                 if event_type == "done":
                     # 最终回复事件：包含完整回复、usage、tool_trace、auto_title
-                    auto_title = _generate_auto_title(session)
+                    # 标题已由后台 title_task 异步生成推送，done 中仅做兜底检查
+                    auto_title = None
+                    if session.get_meta().get("title", "") in ("新会话", ""):
+                        # 标题任务未完成或失败，降级截取
+                        clean = req.message.replace("\n", " ").strip()
+                        auto_title = clean[:20]
+                        if len(clean) > 20:
+                            auto_title += "…"
+                        session.set_meta(title=auto_title)
+                        session.save()
 
                     done_data = {
                         "reply": data.get("reply", ""),
@@ -771,6 +801,12 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
                 loop_task.cancel()
                 try:
                     await loop_task
+                except asyncio.CancelledError:
+                    pass
+            if title_task is not None and not title_task.done():
+                title_task.cancel()
+                try:
+                    await title_task
                 except asyncio.CancelledError:
                     pass
 

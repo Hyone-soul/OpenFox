@@ -69,7 +69,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, inject } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted, inject } from 'vue'
 import {
   MagicStick, Document, DataAnalysis, ChatLineRound,
   FolderOpened,
@@ -103,14 +103,39 @@ const {
   updateSessionTitle,
 } = useChatSessions()
 
-const messages = ref([])
-const toolEvents = ref([])
-const sending = ref(false)
-const streamingReply = ref('')
-const streamingReasoning = ref('')
-const errorState = ref(null)
-const requestController = ref(null)
+// ========== 按会话隔离的聊天状态池 ==========
+
+const sessionStates = reactive({})
+
+function getSessionState(sid) {
+  if (sid && !sessionStates[sid]) {
+    sessionStates[sid] = {
+      messages: [],
+      toolEvents: [],
+      streamingReply: '',
+      streamingReasoning: '',
+      sending: false,
+      errorState: null,
+      lastFailedPrompt: '',
+      requestController: null,
+      _loaded: false,  // 是否已从后端加载过历史
+    }
+  }
+  return sid ? sessionStates[sid] : null
+}
+
+// 对外暴露的响应式状态：始终指向当前活跃会话的状态槽
+const messages = computed(() => getSessionState(activeSession.value)?.messages ?? [])
+const toolEvents = computed(() => getSessionState(activeSession.value)?.toolEvents ?? [])
+const sending = computed(() => getSessionState(activeSession.value)?.sending ?? false)
+const streamingReply = computed(() => getSessionState(activeSession.value)?.streamingReply ?? '')
+const streamingReasoning = computed(() => getSessionState(activeSession.value)?.streamingReasoning ?? '')
+const errorState = computed(() => getSessionState(activeSession.value)?.errorState ?? null)
+
+// lastFailedPrompt 保留为普通 ref（非会话相关 UI 态）
+// sendMessage 中会同步写入会话槽，retryLast 从当前槽读取
 const lastFailedPrompt = ref('')
+const requestController = ref(null)
 
 
 // 当前会话关联的项目 ID
@@ -217,19 +242,13 @@ const suggestions = [
 ]
 
 watch(activeSession, async (id) => {
-  if (id) {
-    toolEvents.value = []
-    streamingReply.value = ''
-    streamingReasoning.value = ''
-    errorState.value = null
+  if (!id) return
+  const st = getSessionState(id)
+  // 仅首次进入该会话时从后端拉取历史；此后复用槽内状态（含后台流累积的进度）
+  if (!st._loaded) {
+    st._loaded = true
     const data = await chatApi.sessionMessages(id)
-    messages.value = rebuildToolEvents(data.messages)
-  } else {
-    messages.value = []
-    toolEvents.value = []
-    streamingReply.value = ''
-    streamingReasoning.value = ''
-    errorState.value = null
+    st.messages = rebuildToolEvents(data.messages)
   }
 })
 
@@ -345,19 +364,26 @@ async function sendMessage(text) {
     const s = await createSession('新会话')
     selectSession(s.id)
   }
-  messages.value.push({ role: 'user', content: prompt })
-  sending.value = true
-  toolEvents.value = []
-  streamingReply.value = ''
-  streamingReasoning.value = ''
-  errorState.value = null
-  lastFailedPrompt.value = ''
+  // 绑定发起请求时的会话 ID —— SSE 事件始终写入该会话的状态槽，
+  // 不受用户中途切换会话影响
+  const targetSid = activeSession.value
+  const st = getSessionState(targetSid)
+  st.messages.push({ role: 'user', content: prompt })
+  st.sending = true
+  st.toolEvents = []
+  st.streamingReply = ''
+  st.streamingReasoning = ''
+  st.errorState = null
+  st.lastFailedPrompt = ''
   const controller = new AbortController()
+  st.requestController = controller
+  // 同步到全局 ref（stopSending / onUnmounted 兼容）
   requestController.value = controller
+  lastFailedPrompt.value = ''
 
   try {
     const stream = chatApi.chatStream({
-      session_id: activeSession.value,
+      session_id: targetSid,
       message: prompt,
       model: selectedModel.value || undefined,
     }, { signal: controller.signal })
@@ -365,9 +391,9 @@ async function sendMessage(text) {
     for await (const { type, data } of stream) {
       if (type === 'tool_call') {
         // 先把已积累的流式文本刷入 messages（工具调用前的思考文本）
-        flushStreamingReply()
+        flushStreamingReply(st)
         const stepIdx = data.step ?? 0
-        const lastMsg = messages.value[messages.value.length - 1]
+        const lastMsg = st.messages[st.messages.length - 1]
         if (lastMsg && lastMsg.role === 'tool_events' && lastMsg.step === stepIdx) {
           // 同一步骤的后续工具调用，追加到同一张卡片
           lastMsg.events.push({
@@ -381,7 +407,7 @@ async function sendMessage(text) {
           })
         } else {
           // 新步骤：创建新的工具卡片，直接推入消息流
-          messages.value.push({
+          st.messages.push({
             role: 'tool_events',
             step: stepIdx,
             events: [{
@@ -399,8 +425,8 @@ async function sendMessage(text) {
         }
       } else if (type === 'tool_result') {
         const stepIdx = data.step ?? 0
-        for (let i = messages.value.length - 1; i >= 0; i--) {
-          const m = messages.value[i]
+        for (let i = st.messages.length - 1; i >= 0; i--) {
+          const m = st.messages[i]
           if (m.role === 'tool_events' && m.step === stepIdx) {
             const evt = m.events.find(e =>
               (data.id && e.id === data.id) || (e.status === 'running' && e.name === data.name)
@@ -414,30 +440,34 @@ async function sendMessage(text) {
           }
         }
       } else if (type === 'assistant_delta') {
-        // 文本增量直接累积到 streamingReply，reasoning 累积到 streamingReasoning
-        streamingReply.value += data.content || ''
-        streamingReasoning.value += data.reasoning || ''
+        // 文本增量直接累积到会话槽的 streamingReply
+        st.streamingReply += data.content || ''
+        st.streamingReasoning += data.reasoning || ''
       } else if (type === 'done') {
-        const streamText = streamingReply.value.trim()
-        const reasoningText = streamingReasoning.value.trim()
+        const streamText = st.streamingReply.trim()
+        const reasoningText = st.streamingReasoning.trim()
         const replyText = data.reply ? String(data.reply).trim() : ''
         if (replyText && streamText && replyText.startsWith(streamText)) {
-          messages.value.push({ role: 'assistant', content: data.reply, reasoning: reasoningText || undefined })
+          st.messages.push({ role: 'assistant', content: data.reply, reasoning: reasoningText || undefined })
         } else if (streamText) {
-          messages.value.push({ role: 'assistant', content: streamingReply.value, reasoning: reasoningText || undefined })
+          st.messages.push({ role: 'assistant', content: st.streamingReply, reasoning: reasoningText || undefined })
         } else if (replyText) {
-          messages.value.push({ role: 'assistant', content: data.reply, reasoning: reasoningText || undefined })
+          st.messages.push({ role: 'assistant', content: data.reply, reasoning: reasoningText || undefined })
         }
-        streamingReply.value = ''
-        streamingReasoning.value = ''
-        lastFailedPrompt.value = ''
+        st.streamingReply = ''
+        st.streamingReasoning = ''
+        st.lastFailedPrompt = ''
         if (data.auto_title) {
-          updateSessionTitle(activeSession.value, data.auto_title)
+          updateSessionTitle(targetSid, data.auto_title)
+        }
+      } else if (type === 'title_updated') {
+        if (data.title) {
+          updateSessionTitle(targetSid, data.title)
         }
       } else if (type === 'tool_confirm') {
         // 危险命令确认：渲染确认卡片，用户点击后调用 /v1/tool/confirm
-        flushStreamingReply()
-        messages.value.push({
+        flushStreamingReply(st)
+        st.messages.push({
           role: 'tool_confirm',
           id: data.id,
           name: data.name,
@@ -445,49 +475,52 @@ async function sendMessage(text) {
           confirmed: false,
         })
       } else if (type === 'cancelled') {
-        markLastToolEventsInterrupted('任务已停止。')
-        flushStreamingReply()
-        addSystemMsg(data.message || '任务已停止')
+        markLastToolEventsInterrupted(st, '任务已停止。')
+        flushStreamingReply(st)
+        addSystemMsg(st, data.message || '任务已停止')
       } else if (type === 'error') {
-        markLastToolEventsInterrupted(data.message || '对话出错。')
-        flushStreamingReply()
-        setChatError(data.message || '对话出错', prompt)
+        markLastToolEventsInterrupted(st, data.message || '对话出错。')
+        flushStreamingReply(st)
+        setChatError(st, data.message || '对话出错', prompt)
       }
     }
   } catch (e) {
     if (e.name === 'AbortError') {
-      markLastToolEventsInterrupted('任务已停止。')
-      flushStreamingReply()
-      addSystemMsg('任务已停止')
+      markLastToolEventsInterrupted(st, '任务已停止。')
+      flushStreamingReply(st)
+      addSystemMsg(st, '任务已停止')
     } else {
-      markLastToolEventsInterrupted(e.message || '连接异常。')
-      flushStreamingReply()
-      setChatError(e.message || '发送失败', prompt)
+      markLastToolEventsInterrupted(st, e.message || '连接异常。')
+      flushStreamingReply(st)
+      setChatError(st, e.message || '发送失败', prompt)
     }
   } finally {
-    sending.value = false
+    st.sending = false
+    if (st.requestController === controller) st.requestController = null
     if (requestController.value === controller) requestController.value = null
     fetchContextStatus()
   }
 }
 
 function stopSending() {
-  if (!sending.value) return
-  requestController.value?.abort()
+  // 停止当前活跃会话的请求
+  const st = getSessionState(activeSession.value)
+  if (!st || !st.sending) return
+  st.requestController?.abort()
 }
 
-function flushStreamingReply() {
+function flushStreamingReply(st) {
   // 把当前积累的流式文本刷入 messages 作为 assistant 消息
-  if (streamingReply.value.trim()) {
-    messages.value.push({ role: 'assistant', content: streamingReply.value, reasoning: streamingReasoning.value.trim() || undefined })
+  if (st.streamingReply.trim()) {
+    st.messages.push({ role: 'assistant', content: st.streamingReply, reasoning: st.streamingReasoning.trim() || undefined })
   }
-  streamingReply.value = ''
-  streamingReasoning.value = ''
+  st.streamingReply = ''
+  st.streamingReasoning = ''
 }
 
-function markLastToolEventsInterrupted(reason = '操作已中断。') {
+function markLastToolEventsInterrupted(st, reason = '操作已中断。') {
   // 标记所有仍在运行的工具卡片为中断状态
-  for (const m of messages.value) {
+  for (const m of st.messages) {
     if (m.role === 'tool_events' && m.events?.some(e => e.status === 'running')) {
       m.interrupted = true
       m.interruptedReason = reason
@@ -501,17 +534,19 @@ function markLastToolEventsInterrupted(reason = '操作已中断。') {
   }
 }
 
-function setChatError(message, prompt) {
-  errorState.value = { message, prompt }
-  lastFailedPrompt.value = prompt
+function setChatError(st, message, prompt) {
+  st.errorState = { message, prompt }
+  st.lastFailedPrompt = prompt
 }
 
 async function retryLast() {
-  const prompt = lastFailedPrompt.value
-  if (!prompt || sending.value) return
-  const lastMessage = messages.value[messages.value.length - 1]
+  const st = getSessionState(activeSession.value)
+  if (!st) return
+  const prompt = st.lastFailedPrompt
+  if (!prompt || st.sending) return
+  const lastMessage = st.messages[st.messages.length - 1]
   if (lastMessage?.role === 'user' && lastMessage.content === prompt) {
-    messages.value.pop()
+    st.messages.pop()
   }
   await sendMessage(prompt)
 }
@@ -557,15 +592,15 @@ async function handleCommand(cmd) {
 async function cmdNew() {
   const s = await createSession('新会话')
   selectSession(s.id)
-  messages.value = []
-  toolEvents.value = []
+  // 新会话槽由 getSessionState 自动初始化为空，无需手动清空
   ElMessage.success('已新建会话')
 }
 
 // /compact — 压缩上下文，结果内联展示到聊天流
 async function cmdCompact() {
+  const st = getSessionState(activeSession.value)
   try {
-    addSystemMsg('正在压缩上下文...')
+    addSystemMsg(st, '正在压缩上下文...')
     const result = await contextApi.compact()
     if (result.success) {
       const lines = [
@@ -573,20 +608,21 @@ async function cmdCompact() {
         `  原始: ${result.original_tokens} tokens → 压缩后: ${result.compressed_tokens} tokens`,
         `  节省: ${result.savings_percent}%  |  消息: ${result.messages_before} → ${result.messages_after}`,
       ]
-      addSystemMsg(lines.join('\n'))
+      addSystemMsg(st, lines.join('\n'))
     } else if (result.skipped) {
-      addSystemMsg(`上下文未达到压缩阈值（当前 ${result.current_tokens} tokens）`)
+      addSystemMsg(st, `上下文未达到压缩阈值（当前 ${result.current_tokens} tokens）`)
     } else {
-      addSystemMsg(`压缩失败: ${result.error || '未知错误'}`)
+      addSystemMsg(st, `压缩失败: ${result.error || '未知错误'}`)
     }
     fetchContextStatus()
   } catch (e) {
-    addSystemMsg(`压缩请求失败: ${e.message || ''}`)
+    addSystemMsg(st, `压缩请求失败: ${e.message || ''}`)
   }
 }
 
 // /skill — 统一展示技能、工具、MCP 三类信息
 async function cmdSkill() {
+  const st = getSessionState(activeSession.value)
   let skillLines = []
   let toolLines = []
   let mcpLines = []
@@ -615,7 +651,7 @@ async function cmdSkill() {
   }
 
   if (!skillLines.length && !toolLines.length && !mcpLines.length) {
-    addSystemMsg('暂无技能、工具或 MCP 服务')
+    addSystemMsg(st, '暂无技能、工具或 MCP 服务')
     return
   }
 
@@ -632,7 +668,7 @@ ${toolLines.join('\n')}`
     output += `${output ? '\n\n' : ''}MCP 服务 (${mcpLines.length}):
 ${mcpLines.join('\n')}`
   }
-  addSystemMsg(output)
+  addSystemMsg(st, output)
 }
 
 // /memory — 跳转到侧栏设置面板中的记忆管理
@@ -641,13 +677,15 @@ async function cmdMemory() {
     openSettingsDialog('memory')
     ElMessage.success('已打开记忆管理')
   } else {
-    addSystemMsg('记忆管理面板不可用，请通过侧栏底部 设置 → 记忆管理 访问')
+    addSystemMsg(getSessionState(activeSession.value), '记忆管理面板不可用，请通过侧栏底部 设置 → 记忆管理 访问')
   }
 }
 
 // /help
 function cmdHelp() {
+  const st = getSessionState(activeSession.value)
   addSystemMsg(
+    st,
     `可用命令:\n` +
     `  /model    切换模型\n` +
     `  /new      新建会话\n` +
@@ -658,17 +696,21 @@ function cmdHelp() {
   )
 }
 
-function addSystemMsg(content) {
-  messages.value.push({ role: 'system', content })
+function addSystemMsg(st, content) {
+  if (!st) return
+  st.messages.push({ role: 'system', content })
 }
 
 async function handleToolConfirm(confirmId, approved) {
+  const st = getSessionState(activeSession.value)
   // 更新卡片状态
-  for (const m of messages.value) {
-    if (m.role === 'tool_confirm' && m.id === confirmId) {
-      m.confirmed = true
-      m.approved = approved
-      break
+  if (st) {
+    for (const m of st.messages) {
+      if (m.role === 'tool_confirm' && m.id === confirmId) {
+        m.confirmed = true
+        m.approved = approved
+        break
+      }
     }
   }
   // 通知后端
@@ -683,7 +725,13 @@ onMounted(() => {
   loadAll()
 })
 
-onUnmounted(() => requestController.value?.abort())
+onUnmounted(() => {
+  // 组件卸载时终止所有会话的后台请求
+  for (const sid in sessionStates) {
+    sessionStates[sid].requestController?.abort()
+  }
+  requestController.value?.abort()
+})
 </script>
 
 <style scoped>
