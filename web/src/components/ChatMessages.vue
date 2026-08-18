@@ -1,5 +1,5 @@
 <template>
-  <div class="chat-messages" ref="scrollRef">
+  <div class="chat-messages" ref="scrollRef" @scroll="handleScroll">
     <!-- 空状态：提示发消息 -->
     <div v-if="!messages.length && !loading" class="chat-empty">
       <el-icon class="empty-icon"><ChatLineRound /></el-icon>
@@ -80,6 +80,30 @@
         <div class="msg-body">
           <div class="msg-bubble system-bubble interrupted-bubble">
             <div class="msg-content plain system-content">{{ m.content }}</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 危险命令确认卡片 -->
+      <div v-else-if="m.role === 'tool_confirm'" class="msg-row assistant">
+        <div v-if="messageShowAvatar[i]" class="msg-avatar ai-avatar">
+          <img src="/OpenFox.png" class="avatar-img" alt="OpenFox" />
+        </div>
+        <div v-else class="msg-avatar-spacer"></div>
+        <div class="msg-body">
+          <div class="confirm-card" :class="{ 'confirm-resolved': m.confirmed }">
+            <div class="confirm-header">
+              <span class="confirm-icon">!</span>
+              <span class="confirm-title">危险操作确认</span>
+            </div>
+            <div class="confirm-cmd">{{ m.cmd }}</div>
+            <div v-if="m.confirmed" class="confirm-result">
+              {{ m.approved ? '已允许执行' : '已拒绝' }}
+            </div>
+            <div v-else class="confirm-actions">
+              <button class="confirm-btn confirm-allow" @click="$emit('toolConfirm', m.id, true)">允许</button>
+              <button class="confirm-btn confirm-deny" @click="$emit('toolConfirm', m.id, false)">拒绝</button>
+            </div>
           </div>
         </div>
       </div>
@@ -171,7 +195,7 @@ const props = defineProps({
   errorState: { type: Object, default: null },
 })
 
-const emit = defineEmits(['retry', 'openSettings'])
+const emit = defineEmits(['retry', 'openSettings', 'toolConfirm'])
 
 // 思考过程折叠状态
 const reasoningCollapsed = ref({})
@@ -228,6 +252,24 @@ const md = new MarkdownIt({
   breaks: true,
 })
 
+// ── 滚动控制 ──
+// 用户是否停留在底部附近（距底 80px 内）；上滑后停止自动拉底
+const isAtBottom = ref(true)
+const SCROLL_BOTTOM_THRESHOLD = 80
+
+function handleScroll() {
+  const el = scrollRef.value
+  if (!el) return
+  isAtBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_BOTTOM_THRESHOLD
+}
+
+function scrollToBottom() {
+  if (scrollRef.value) {
+    isAtBottom.value = true
+    scrollRef.value.scrollTop = scrollRef.value.scrollHeight
+  }
+}
+
 function renderMarkdown(text) {
   if (!text) return ''
   return md.render(text)
@@ -259,13 +301,23 @@ function formatTime(ts) {
   return `${hh}:${mm}`
 }
 
+// 自动滚动：仅在用户停留在底部时拉底，上滑后不强制滚动
 watch(
-  () => [props.messages.length, props.loading, props.streamingContent, props.streamingReasoning, props.errorState, hasRunningTools.value],
+  () => [props.messages.length, props.streamingContent, props.streamingReasoning, hasRunningTools.value],
   async () => {
     await nextTick()
-    if (scrollRef.value) {
+    if (scrollRef.value && isAtBottom.value) {
       scrollRef.value.scrollTop = scrollRef.value.scrollHeight
     }
+  },
+)
+
+// 新消息发送 / loading 切换时强制拉底（用户主动操作，应跟到底）
+watch(
+  () => [props.messages.length, props.loading, props.errorState],
+  async () => {
+    await nextTick()
+    scrollToBottom()
   },
 )
 </script>
@@ -275,7 +327,6 @@ watch(
   flex: 1;
   overflow-y: auto;
   padding: 24px 24px 12px;
-  scroll-behavior: smooth;
 }
 
 /* 空状态 */
@@ -447,4 +498,55 @@ watch(
   0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
   40% { transform: scale(1); opacity: 1; }
 }
+
+/* 危险命令确认卡片 */
+.confirm-card {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+  padding: 12px 16px;
+  max-width: 560px;
+}
+.confirm-card.confirm-resolved {
+  opacity: 0.7;
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+.confirm-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+}
+.confirm-icon {
+  width: 20px; height: 20px; border-radius: 50%;
+  background: #f59e0b; color: #fff; font-size: 12px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.confirm-title {
+  font-size: 13px; font-weight: 600; color: #92400e;
+}
+.confirm-card.confirm-resolved .confirm-title { color: #64748b; }
+.confirm-cmd {
+  background: #1e293b; color: #e2e8f0; padding: 8px 12px; border-radius: 6px;
+  font-family: 'SF Mono', Consolas, monospace; font-size: 12px;
+  line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+  margin-bottom: 10px;
+}
+.confirm-result {
+  font-size: 12px; color: #64748b;
+}
+.confirm-actions {
+  display: flex; gap: 8px;
+}
+.confirm-btn {
+  padding: 6px 16px; border-radius: 6px; font-size: 13px;
+  cursor: pointer; border: 1px solid; font-weight: 500;
+  transition: all 0.15s;
+}
+.confirm-allow {
+  background: #fff; color: #92400e; border-color: #f59e0b;
+}
+.confirm-allow:hover { background: #fffbeb; }
+.confirm-deny {
+  background: #fff; color: #64748b; border-color: #e2e8f0;
+}
+.confirm-deny:hover { background: #f8fafc; }
 </style>

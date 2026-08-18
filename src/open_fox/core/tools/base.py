@@ -22,6 +22,11 @@ class ToolResult:
     content: str = ""
     error: str = ""
     metadata: dict = field(default_factory=dict)
+    # 确认机制：True 表示该命令需要用户确认才能执行，
+    # AgentLoop 检测到此标志后推送 tool_confirm 事件，等待用户操作。
+    confirm_required: bool = False
+    # 待确认的原始命令（confirm_required=True 时必填）
+    confirm_cmd: str = ""
 
 
 class BaseTool(ABC):

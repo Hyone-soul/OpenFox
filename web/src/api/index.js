@@ -132,9 +132,13 @@ export async function* streamChatFetch(data, options = {}) {
 
     for (const part of parts) {
       if (!part.trim()) continue
+      // SSE 注释行（以 `:` 开头，如 `: keepalive`），直接跳过
+      if (part.trim().startsWith(':')) continue
       let eventType = 'message'
       let eventData = '{}'
       for (const line of part.split('\n')) {
+        // 跳过行内注释（如 `: keepalive`）
+        if (line.startsWith(':')) continue
         if (line.startsWith('event:')) {
           eventType = line.slice(6).trim()
         } else if (line.startsWith('data:')) {
@@ -220,4 +224,5 @@ export const contextApi = {
 
 export const toolsApi = {
   list: () => http.get('/tools').then(r => r.data),
+  confirm: (confirmId, approved) => http.post('/tool/confirm', { confirm_id: confirmId, approved }).then(r => r.data),
 }

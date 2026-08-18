@@ -55,16 +55,22 @@ class GrepSearchTool(BaseTool):
         except re.error as e:
             return ToolResult(success=False, error=f"正则语法错误：{e}")
 
-        root_str = kwargs.get("path", ".")
+        # 防御性转换：LLM 可能传入非字符串 path（如整数），统一转 str
+        root_str = str(kwargs.get("path", "."))
         try:
             root = self._guard.resolve(root_str)
         except PathGuardViolation as e:
             return ToolResult(success=False, error=str(e))
+
+        max_results = min(kwargs.get("max_results", _MAX_RESULTS), _MAX_RESULTS)
+
+        # path 指向文件：直接搜索该文件内容
+        if root.is_file():
+            return self._search_single_file(root, regex, max_results)
         if not root.is_dir():
-            return ToolResult(success=False, error=f"不是目录：{root}")
+            return ToolResult(success=False, error=f"路径不存在：{root}")
 
         include = kwargs.get("include", "")
-        max_results = min(kwargs.get("max_results", _MAX_RESULTS), _MAX_RESULTS)
         results = []
 
         for path in self._walk(root):
@@ -89,6 +95,26 @@ class GrepSearchTool(BaseTool):
                             metadata={"truncated": True},
                         )
 
+        if not results:
+            return ToolResult(success=True, content="未找到匹配项")
+        return ToolResult(success=True, content="\n".join(results))
+
+    def _search_single_file(self, file_path: Path, regex: re.Pattern, max_results: int) -> ToolResult:
+        """搜索单个文件内容，用于 path 指向文件而非目录的场景。"""
+        if file_path.suffix.lower() in self._SKIP_EXTS:
+            return ToolResult(success=True, content="未找到匹配项（文件类型已跳过）")
+        try:
+            if file_path.stat().st_size > _MAX_FILE_SIZE:
+                return ToolResult(success=True, content="文件过大，已跳过")
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return ToolResult(success=False, error=f"读取文件失败：{e}")
+        results = []
+        for i, line in enumerate(text.splitlines(), 1):
+            if regex.search(line):
+                results.append(f"{file_path.name}:{i}: {line.strip()}")
+                if len(results) >= max_results:
+                    break
         if not results:
             return ToolResult(success=True, content="未找到匹配项")
         return ToolResult(success=True, content="\n".join(results))
@@ -120,13 +146,17 @@ class GlobFindTool(BaseTool):
         self._guard = path_guard
 
     def execute(self, **kwargs) -> ToolResult:
-        root_str = kwargs.get("path", ".")
+        # 防御性转换：LLM 可能传入非字符串 path
+        root_str = str(kwargs.get("path", "."))
         try:
             root = self._guard.resolve(root_str)
         except PathGuardViolation as e:
             return ToolResult(success=False, error=str(e))
+        # glob_find 语义上需要目录作为根，但 path 指向文件时给出明确提示
+        if root.is_file():
+            return ToolResult(success=False, error=f"path 指向文件而非目录：{root}，如需搜索文件内容请使用 grep_search")
         if not root.is_dir():
-            return ToolResult(success=False, error=f"不是目录：{root}")
+            return ToolResult(success=False, error=f"路径不存在：{root}")
 
         pattern = kwargs["pattern"]
         max_results = min(kwargs.get("max_results", _MAX_RESULTS), _MAX_RESULTS)

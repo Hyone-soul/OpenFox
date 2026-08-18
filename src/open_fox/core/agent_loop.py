@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -112,6 +113,10 @@ class AgentLoop:
     # 签名: async on_tool_event(event_type: str, data: dict)
     # event_type: "tool_call" | "tool_result" | "reply"
     on_tool_event: Callable[[str, dict], Awaitable[None]] | None = None
+    # 危险命令确认回调：推送 tool_confirm 事件后等待用户确认
+    # 签名: async on_confirm(confirm_id: str) -> bool
+    # 返回 True 表示用户允许执行，False 表示拒绝
+    on_confirm: Callable[[str], Awaitable[bool]] | None = None
     # 全局记忆管理器：非空时把 memory_text() 注入 system prompt，每轮 register_turn()
     memory_manager: MemoryManager | None = None
     # 上下文压缩器（可选，为 None 则不触发压缩）
@@ -231,6 +236,36 @@ class AgentLoop:
                     })
 
                 result = await self._dispatch(tc)
+
+                # 确认机制：工具返回 confirm_required 时，推送 tool_confirm 事件，
+                # 等待用户确认后重新执行（带 _confirmed=True）或跳过。
+                if isinstance(result, ToolResult) and result.confirm_required:
+                    confirm_id = f"confirm-{self.current_step}-{_tc_idx}"
+                    if self.on_tool_event is not None:
+                        await self.on_tool_event("tool_confirm", {
+                            "id": confirm_id,
+                            "step": self.current_step,
+                            "name": tc.name,
+                            "args": tc.args,
+                            "cmd": result.confirm_cmd,
+                        })
+                    # 等待外部确认回调：on_confirm(confirm_id, approved)
+                    if self.on_confirm is not None:
+                        approved = await self.on_confirm(confirm_id)
+                    else:
+                        approved = False
+                    if approved:
+                        # 用户允许：带 _confirmed 标记重新执行
+                        tc_args = dict(tc.args)
+                        tc_args["_confirmed"] = True
+                        confirmed_tc = ToolCall(id=tc.id, name=tc.name, args=tc_args)
+                        result = await self._dispatch(confirmed_tc)
+                    else:
+                        result = ToolResult(
+                            success=False,
+                            error=f"用户拒绝了危险命令：{result.confirm_cmd}",
+                        )
+
                 _tool_elapsed = time.monotonic() - _tool_start
                 result_text = _result_text(result)
                 self.tool_trace.append({
@@ -446,12 +481,15 @@ class AgentLoop:
         target = self.registry.resolve(tc.name)
         if target is None:
             return ToolResult(success=False, error=f"未知工具：{tc.name}")
-        # 内置工具：若目标重写了 async_run（Memory 工具），走异步；否则同步 execute
+        # 内置工具：若目标重写了 async_run（Memory 工具），走异步；
+        # 否则用 asyncio.to_thread 在线程池执行同步 execute，避免阻塞事件循环。
+        # 这样 _dispatch 始终返回协程，SSE 生成器 / on_chunk 回调不会因
+        # subprocess.run 等同步调用卡死。
         if hasattr(target, "execute") and callable(target.execute):
             try:
                 if type(target).async_run is not BaseTool.async_run:
                     return await target.async_run(**tc.args)
-                return target.execute(**tc.args)
+                return await asyncio.to_thread(target.execute, **tc.args)
             except Exception as e:  # noqa: BLE001
                 return ToolResult(success=False, error=f"工具异常：{e}")
         # MCP 工具

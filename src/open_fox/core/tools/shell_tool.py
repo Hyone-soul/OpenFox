@@ -7,12 +7,16 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 from open_fox.core.exceptions import DangerousCommand, ScriptTimeout
-from open_fox.core.security.command_blacklist import check_command
+from open_fox.core.security.command_blacklist import check_command, check_dangerous
 from open_fox.core.tools.base import BaseTool, ToolResult
+
+# 当前进程 PID（启动时获取，防止 LLM 通过 shell 命令杀死自身）
+_SELF_PID = os.getpid()
 
 
 class RunShellTool(BaseTool):
@@ -56,7 +60,27 @@ class RunShellTool(BaseTool):
         except DangerousCommand as e:
             return ToolResult(success=False, error=str(e))
 
-        # 2. 执行
+        # 2. 危险命令确认：命中 DANGEROUS_PATTERNS 则返回 confirm_required，
+        #    由 AgentLoop 推送 tool_confirm 事件等待用户确认。
+        #    确认通过后 shell_tool 会被再次调用，此时 cmd 不再触发确认
+        #    （因为 kwargs 中带 _confirmed=True）
+        if not kwargs.get("_confirmed") and check_dangerous(cmd):
+            return ToolResult(
+                success=False,
+                error="",
+                confirm_required=True,
+                confirm_cmd=cmd,
+            )
+
+        # 3. 自身进程保护：禁止杀死当前 OpenFox 后端进程
+        pid_str = str(_SELF_PID)
+        if pid_str in cmd:
+            return ToolResult(
+                success=False,
+                error=f"禁止杀死当前进程（PID: {pid_str}），该命令已被拦截",
+            )
+
+        # 4. 执行
         try:
             proc = subprocess.run(
                 cmd,

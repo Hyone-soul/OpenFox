@@ -46,7 +46,7 @@ def _enrich_messages_with_reasoning(messages: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for m in messages:
-        new_m = {k: v for k, v in m.items() if k != "_meta"}
+        new_m = {k: v for k, v in m.items() if k != "_meta" and k != "_compressed"}
         # 防御性清理：content=None → ""
         if new_m.get("content") is None:
             new_m["content"] = ""

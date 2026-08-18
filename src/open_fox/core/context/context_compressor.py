@@ -270,9 +270,11 @@ class ContextCompressor:
 
         # ── Step 5: 组装压缩后的消息列表 ──
         # 摘要消息（user 角色，确保角色交替）
+        # _compressed 标记用于内部识别（标题生成时过滤），发送给 LLM 前由适配器剥离
         summary_message = {
             "role": "user",
             "content": summary_text,
+            "_compressed": True,
         }
         # 重新注入被压缩掉的技能标记
         pruned_skills = self._extract_pruned_skill_markers(middle)
@@ -283,6 +285,7 @@ class ContextCompressor:
         confirm_message = {
             "role": "assistant",
             "content": "[Context compressed — continuing from summary]",
+            "_compressed": True,
         }
 
         compressed_messages = meta_messages + head + [summary_message, confirm_message] + tail
@@ -682,6 +685,7 @@ Respond with a structured summary in this format:
                 result.append({
                     "role": "user",
                     "content": f"[Context anchor: {anchor_content}]",
+                    "_compressed": True,
                 })
 
             result.append(messages[i])

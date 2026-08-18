@@ -37,10 +37,11 @@
           :loading="sending"
           :streaming-content="streamingReply"
           :streaming-reasoning="streamingReasoning"
-          :error-state="errorState"
-          agent-name="OpenFox"
-          @retry="retryLast"
-          @open-settings="() => openSettingsDialog?.('models')"
+           :error-state="errorState"
+           agent-name="OpenFox"
+           @retry="retryLast"
+           @open-settings="() => openSettingsDialog?.('models')"
+           @tool-confirm="handleToolConfirm"
         />
 
 <!-- 输入区 -->
@@ -74,7 +75,7 @@ import {
   FolderOpened,
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { chatApi, modelApi, skillApi, metaApi, mcpApi, contextApi } from '../api'
+import { chatApi, modelApi, skillApi, metaApi, mcpApi, contextApi, toolsApi } from '../api'
 import { useChatSessions } from '../composables/useChatSessions'
 import ChatMessages from '../components/ChatMessages.vue'
 import ChatInput from '../components/ChatInput.vue'
@@ -433,6 +434,16 @@ async function sendMessage(text) {
         if (data.auto_title) {
           updateSessionTitle(activeSession.value, data.auto_title)
         }
+      } else if (type === 'tool_confirm') {
+        // 危险命令确认：渲染确认卡片，用户点击后调用 /v1/tool/confirm
+        flushStreamingReply()
+        messages.value.push({
+          role: 'tool_confirm',
+          id: data.id,
+          name: data.name,
+          cmd: data.cmd,
+          confirmed: false,
+        })
       } else if (type === 'cancelled') {
         markLastToolEventsInterrupted('任务已停止。')
         flushStreamingReply()
@@ -649,6 +660,23 @@ function cmdHelp() {
 
 function addSystemMsg(content) {
   messages.value.push({ role: 'system', content })
+}
+
+async function handleToolConfirm(confirmId, approved) {
+  // 更新卡片状态
+  for (const m of messages.value) {
+    if (m.role === 'tool_confirm' && m.id === confirmId) {
+      m.confirmed = true
+      m.approved = approved
+      break
+    }
+  }
+  // 通知后端
+  try {
+    await toolsApi.confirm(confirmId, approved)
+  } catch {
+    // 确认请求可能已过期，静默处理
+  }
 }
 
 onMounted(() => {

@@ -465,6 +465,40 @@ class ChatResponse(BaseModel):
     auto_title: str | None = None
 
 
+def _generate_auto_title(session) -> str | None:
+    """为首轮会话自动生成标题（过滤压缩摘要消息）。
+
+    当标题仍为默认值且仅有 1 条真实用户消息（排除上下文压缩插入的
+    ``role="user"`` 摘要/锚点消息）时，取该消息前 20 字作为标题。
+
+    Returns:
+        生成的标题字符串；若不满足条件则返回 None。
+    """
+    meta = session.get_meta()
+    if meta.get("title", "") not in ("新会话", ""):
+        return None
+
+    # 过滤掉压缩摘要/锚点消息，只统计真实用户消息
+    real_user_msgs = [
+        m for m in session.chat_messages()
+        if m.get("role") == "user" and not m.get("_compressed")
+    ]
+    if len(real_user_msgs) != 1:
+        return None
+
+    first_user_msg = real_user_msgs[0].get("content", "")
+    if not first_user_msg:
+        return None
+
+    clean = first_user_msg.replace("\n", " ").strip()
+    title = clean[:20]
+    if len(clean) > 20:
+        title += "…"
+    session.set_meta(title=title)
+    session.save()
+    return title
+
+
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat(request: Request, req: ChatRequest) -> ChatResponse:
     username = _username(request)
@@ -547,24 +581,8 @@ async def chat(request: Request, req: ChatRequest) -> ChatResponse:
             session_id=req.session_id,
         )
 
-        # 自动标题：当标题仍为默认值且只有1条用户消息时，从消息内容生成简短标题
-        auto_title = None
-        meta = session.get_meta()
-        chat_msgs = session.chat_messages()
-        user_msg_count = sum(1 for m in chat_msgs if m.get("role") == "user")
-        if meta.get("title", "") in ("新会话", "") and user_msg_count <= 1:
-            first_user_msg = ""
-            for m in chat_msgs:
-                if m.get("role") == "user":
-                    first_user_msg = m.get("content", "")
-                    break
-            if first_user_msg:
-                # 截取前20个字符作为标题，去除换行
-                auto_title = first_user_msg.replace("\n", " ").strip()[:20]
-                if len(first_user_msg.replace("\n", " ").strip()) > 20:
-                    auto_title += "…"
-                session.set_meta(title=auto_title)
-                session.save()
+        # 自动标题：首轮会话从消息内容生成简短标题（过滤压缩摘要）
+        auto_title = _generate_auto_title(session)
 
         # 显式 dump 保证所有字段都被序列化（pydantic 默认 exclude_unset 会过滤）
         return ChatResponse(
@@ -616,6 +634,10 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
         # 事件队列：AgentLoop 回调写入，SSE 生成器读取
         event_queue: asyncio.Queue = asyncio.Queue()
 
+        # 危险命令确认注册表：confirm_id → asyncio.Future[bool]
+        # on_confirm 回调等待 Future，POST /v1/tool/confirm 端点设置 Future 结果
+        _confirm_pending: dict[str, asyncio.Future] = {}
+
         async def on_tool_event(event_type: str, data: dict):
             await event_queue.put((event_type, data))
 
@@ -626,6 +648,19 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
                     "reasoning": chunk.reasoning_delta,
                     "step": loop.current_step if loop is not None else 0,
                 }))
+
+        async def on_confirm(confirm_id: str) -> bool:
+            """等待用户确认危险命令，返回 True（允许）或 False（拒绝）。"""
+            loop_ref = asyncio.get_running_loop()
+            future = loop_ref.create_future()
+            _confirm_pending[confirm_id] = future
+            _global_confirm_pending[confirm_id] = future  # 全局注册，POST /v1/tool/confirm 可访问
+            try:
+                result = await future
+                return bool(result)
+            finally:
+                _confirm_pending.pop(confirm_id, None)
+                _global_confirm_pending.pop(confirm_id, None)
 
         reply_text = ""
         loop = None
@@ -646,6 +681,7 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
                 compressor=compressor,
                 on_chunk=on_chunk,
                 on_tool_event=on_tool_event,
+                on_confirm=on_confirm,
                 workdir=session_workdir,
             )
 
@@ -665,9 +701,12 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
             loop_task = asyncio.create_task(run_loop())
 
             # 持续从队列读取事件，推送到 SSE
-            # 无事件超时保护：如果连续 120 秒没有任何事件产出（LLM/工具卡死），
-            # 主动取消 loop_task 并向前端推送 error，避免前端无限转圈。
+            # 双重保护机制：
+            # 1. keepalive 心跳：每 15 秒无真实事件时发送 SSE 注释行（`: keepalive\n\n`），
+            #    防止中间代理/浏览器因连接空闲而断开。前端应忽略以 `:` 开头的行。
+            # 2. 空闲超时：连续 120 秒无真实事件（LLM/工具卡死），主动取消任务并推送 error。
             SSE_IDLE_TIMEOUT = 120  # 秒
+            SSE_KEEPALIVE_INTERVAL = 15  # 秒
             idle_seconds = 0.0
             while True:
                 try:
@@ -675,6 +714,9 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
                     idle_seconds = 0.0
                 except asyncio.TimeoutError:
                     idle_seconds += 0.5
+                    # 推送 keepalive 心跳，防止连接被代理/浏览器断开
+                    if idle_seconds > 0 and idle_seconds % SSE_KEEPALIVE_INTERVAL < 0.5:
+                        yield ": keepalive\n\n"
                     if idle_seconds >= SSE_IDLE_TIMEOUT:
                         # 超时：取消后端任务，通知前端
                         logger.warning(
@@ -694,22 +736,7 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
 
                 if event_type == "done":
                     # 最终回复事件：包含完整回复、usage、tool_trace、auto_title
-                    auto_title = None
-                    meta = session.get_meta()
-                    chat_msgs = session.chat_messages()
-                    user_msg_count = sum(1 for m in chat_msgs if m.get("role") == "user")
-                    if meta.get("title", "") in ("新会话", "") and user_msg_count <= 1:
-                        first_user_msg = ""
-                        for m in chat_msgs:
-                            if m.get("role") == "user":
-                                first_user_msg = m.get("content", "")
-                                break
-                        if first_user_msg:
-                            auto_title = first_user_msg.replace("\n", " ").strip()[:20]
-                            if len(first_user_msg.replace("\n", " ").strip()) > 20:
-                                auto_title += "…"
-                            session.set_meta(title=auto_title)
-                            session.save()
+                    auto_title = _generate_auto_title(session)
 
                     done_data = {
                         "reply": data.get("reply", ""),
@@ -790,6 +817,35 @@ async def chat_stream(request: Request, req: ChatRequest):
             "Connection": "keep-alive",
         },
     )
+
+
+# ========== 危险命令确认端点 ==========
+
+# 全局确认注册表：confirm_id → asyncio.Future[bool]
+# _chat_stream_generator 内部创建的 on_confirm 回调会往这里注册 Future，
+# 本端点设置 Future 结果，实现前端 → 后端的确认/拒绝通信。
+_global_confirm_pending: dict[str, asyncio.Future] = {}
+
+
+class ToolConfirmRequest(BaseModel):
+    confirm_id: str
+    approved: bool
+
+
+@app.post("/v1/tool/confirm")
+async def tool_confirm(req: ToolConfirmRequest) -> dict:
+    """用户确认/拒绝危险命令。
+
+    前端弹窗点击"允许"或"拒绝"后调用此端点，后端通过 Future 通知
+    AgentLoop 继续执行或跳过。
+    """
+    future = _global_confirm_pending.get(req.confirm_id)
+    if future is None:
+        raise HTTPException(status_code=404, detail="确认请求不存在或已过期")
+    if future.done():
+        raise HTTPException(status_code=409, detail="确认请求已处理")
+    future.set_result(req.approved)
+    return {"confirm_id": req.confirm_id, "approved": req.approved}
 
 
 @app.get("/v1/skills")
