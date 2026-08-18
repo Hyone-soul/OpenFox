@@ -1,14 +1,3 @@
-﻿---
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: '31e62fc5-b067-4bc1-8f26-004a6e055547'
-  PropagateID: '31e62fc5-b067-4bc1-8f26-004a6e055547'
-  ReservedCode1: 'f2afc31c-b6e1-41fd-bf5b-a46dcedebd81'
-  ReservedCode2: 'f2afc31c-b6e1-41fd-bf5b-a46dcedebd81'
----
-
 # OpenFox
 
 > 自研 **Agent Skills 框架**（Python + FastAPI 后端、Vue3 前端、Electron 桌面端）。OpenAI Chat Completions 完全兼容、Skill 渐进式披露、内置文件/Shell 工具、MCP 扩展，CLI + HTTP + Web + Desktop 四端入口。
