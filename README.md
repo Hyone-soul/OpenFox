@@ -1,5 +1,7 @@
 # OpenFox
 
+<img width="1384" height="1397" alt="OpenFox" src="https://github.com/user-attachments/assets/bf82e486-d418-48da-bcfc-81337b013af4" />
+
 > 自研 **Agent Skills 框架**（Python + FastAPI 后端、Vue3 前端、Electron 桌面端）。OpenAI Chat Completions 完全兼容、Skill 渐进式披露、内置文件/Shell 工具、MCP 扩展，CLI + HTTP + Web + Desktop 四端入口。
 
 [![Python](https://img.shields.io/badge/python-3.13%2B-blue?logo=python&logoColor=white)](https://www.python.org)
@@ -7,6 +9,9 @@
 [![Vue](https://img.shields.io/badge/Vue-3.4%2B-4FC08D?logo=vuedotjs)](https://vuejs.org)
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
+
+<img width="1977" height="1245" alt="image" src="https://github.com/user-attachments/assets/545477d7-5222-40c8-befa-0d4db543c862" />
+
 
 ---
 
