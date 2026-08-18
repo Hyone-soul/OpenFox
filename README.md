@@ -1,6 +1,6 @@
 # OpenFox
 
-<img width="1384" height="1397" alt="OpenFox" src="https://github.com/user-attachments/assets/bf82e486-d418-48da-bcfc-81337b013af4" />
+<img width="150" height="150" alt="OpenFox" src="https://github.com/user-attachments/assets/bf82e486-d418-48da-bcfc-81337b013af4" />
 
 > 自研 **Agent Skills 框架**（Python + FastAPI 后端、Vue3 前端、Electron 桌面端）。OpenAI Chat Completions 完全兼容、Skill 渐进式披露、内置文件/Shell 工具、MCP 扩展，CLI + HTTP + Web + Desktop 四端入口。
 
@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
 
-<img width="1977" height="1245" alt="image" src="https://github.com/user-attachments/assets/545477d7-5222-40c8-befa-0d4db543c862" />
+<img width="1200" height="1200" alt="image" src="https://github.com/user-attachments/assets/545477d7-5222-40c8-befa-0d4db543c862" />
 
 
 ---
