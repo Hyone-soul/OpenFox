@@ -454,6 +454,7 @@ class ChatRequest(BaseModel):
     session_id: str
     message: str
     model: str | None = None
+    plan_mode: bool = False  # 是否启用 Plan Mode（提问→规划→执行）
 
 
 class ChatResponse(BaseModel):
@@ -666,6 +667,40 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
                 _confirm_pending.pop(confirm_id, None)
                 _global_confirm_pending.pop(confirm_id, None)
 
+        # 会话级 Plan 等待标记：on_plan_event await Future 期间为 True
+        # SSE 超时检查据此判断是否跳过空闲超时（仅影响当前会话，不干扰其他会话）
+        plan_waiting = False
+
+        async def on_plan_event(event_type: str, data: dict) -> str:
+            """Plan Mode 事件回调：推送事件到 SSE，对于需等待的事件注册 Future。
+
+            返回值：
+            - plan_clarify → JSON answers 字符串
+            - plan_generated → "execute" | "cancel"
+            - 其余事件 → 空字符串
+            """
+            nonlocal plan_waiting
+            if event_type in ("plan_clarify", "plan_generated"):
+                # 需等待用户操作的事件：推送后注册 Future 等待响应
+                await event_queue.put((event_type, data))
+                loop_ref = asyncio.get_running_loop()
+                future = loop_ref.create_future()
+                pending_id = data.get("clarify_id") or data.get("plan_id") or ""
+                if pending_id:
+                    _global_plan_pending[pending_id] = future
+                plan_waiting = True
+                try:
+                    result = await future
+                    return str(result) if result else ""
+                finally:
+                    plan_waiting = False
+                    if pending_id:
+                        _global_plan_pending.pop(pending_id, None)
+            else:
+                # 纯推送事件（step_start / step_done / complete / cancelled）
+                await event_queue.put((event_type, data))
+                return ""
+
         reply_text = ""
         loop = None
         loop_task = None
@@ -687,6 +722,8 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
                 on_tool_event=on_tool_event,
                 on_confirm=on_confirm,
                 workdir=session_workdir,
+                plan_mode=req.plan_mode,
+                on_plan_event=on_plan_event if req.plan_mode else None,
             )
 
             # 在后台运行 AgentLoop，同时从队列中读取事件并推送 SSE
@@ -735,7 +772,13 @@ async def _chat_stream_generator(request: Request, req: ChatRequest):
                     # 推送 keepalive 心跳，防止连接被代理/浏览器断开
                     if idle_seconds > 0 and idle_seconds % SSE_KEEPALIVE_INTERVAL < 0.5:
                         yield ": keepalive\n\n"
-                    if idle_seconds >= SSE_IDLE_TIMEOUT:
+                    # Plan Mode 等待用户操作时（提问/计划确认），不触发空闲超时
+                    # on_plan_event 回调 await Future 阻塞了 loop_task，event_queue 无事件
+                    # 但属于正常等待，不应强制终止
+                    if plan_waiting:
+                        # 正在等待用户操作：重置空闲计时，避免等待结束后残留累积值误触超时
+                        idle_seconds = 0.0
+                    elif idle_seconds >= SSE_IDLE_TIMEOUT:
                         # 超时：取消后端任务，通知前端
                         logger.warning(
                             "SSE 空闲 %ds 无事件，强制结束会话 %s",
@@ -882,6 +925,65 @@ async def tool_confirm(req: ToolConfirmRequest) -> dict:
         raise HTTPException(status_code=409, detail="确认请求已处理")
     future.set_result(req.approved)
     return {"confirm_id": req.confirm_id, "approved": req.approved}
+
+
+# ========== Plan Mode 端点 ==========
+
+# 全局 Plan 确认注册表：plan_id / clarify_id → asyncio.Future
+# on_plan_event 回调写在这里，POST 端点设置 Future 结果实现前端→后端通信
+_global_plan_pending: dict[str, asyncio.Future] = {}
+
+
+class PlanExecuteRequest(BaseModel):
+    plan_id: str
+    session_id: str = ""
+
+
+@app.post("/v1/plan/execute")
+async def plan_execute(req: PlanExecuteRequest) -> dict:
+    """用户点击「执行计划」后调用，通过 Future 通知 AgentLoop 开始执行。"""
+    future = _global_plan_pending.get(req.plan_id)
+    if future is None:
+        raise HTTPException(status_code=404, detail="计划确认请求不存在或已过期")
+    if future.done():
+        raise HTTPException(status_code=409, detail="计划确认请求已处理")
+    future.set_result("execute")
+    return {"plan_id": req.plan_id, "action": "execute"}
+
+
+class PlanCancelRequest(BaseModel):
+    plan_id: str
+    session_id: str = ""
+
+
+@app.post("/v1/plan/cancel")
+async def plan_cancel(req: PlanCancelRequest) -> dict:
+    """用户点击「取消」后调用，通过 Future 通知 AgentLoop 取消计划。"""
+    future = _global_plan_pending.get(req.plan_id)
+    if future is None:
+        raise HTTPException(status_code=404, detail="计划确认请求不存在或已过期")
+    if future.done():
+        raise HTTPException(status_code=409, detail="计划确认请求已处理")
+    future.set_result("cancel")
+    return {"plan_id": req.plan_id, "action": "cancel"}
+
+
+class PlanClarifyAnswerRequest(BaseModel):
+    clarify_id: str
+    session_id: str = ""
+    answers: list[dict] = Field(default_factory=list)
+
+
+@app.post("/v1/plan/clarify/answer")
+async def plan_clarify_answer(req: PlanClarifyAnswerRequest) -> dict:
+    """用户回答澄清问题后调用，通过 Future 把答案传回 AgentLoop。"""
+    future = _global_plan_pending.get(req.clarify_id)
+    if future is None:
+        raise HTTPException(status_code=404, detail="提问请求不存在或已过期")
+    if future.done():
+        raise HTTPException(status_code=409, detail="提问请求已处理")
+    future.set_result(json.dumps(req.answers, ensure_ascii=False))
+    return {"clarify_id": req.clarify_id, "status": "answered"}
 
 
 @app.get("/v1/skills")

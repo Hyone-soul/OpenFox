@@ -42,6 +42,8 @@
            @retry="retryLast"
            @open-settings="() => openSettingsDialog?.('models')"
            @tool-confirm="handleToolConfirm"
+           @plan-execute="handlePlanExecute"
+           @plan-cancel="handlePlanCancel"
         />
 
 <!-- 输入区 -->
@@ -55,14 +57,26 @@
             :slash-commands="slashCommands"
             :current-value="currentSlashValue"
             :slash-disable-filter="expandedCmd !== null"
+            :plan-mode="planMode"
             @send="sendMessage"
             @stop="stopSending"
             @command="handleCommand"
             @slash-filter="onSlashFilter"
             @select-project="handleSelectProject"
             @create-project="handleCreateProject"
+            @toggle-plan-mode="togglePlanMode"
           />
         </div>
+
+        <!-- Plan Mode 提问弹窗 -->
+        <PlanClarifyDialog
+          :visible="planClarifyVisible"
+          :questions="planClarifyData?.questions || []"
+          :round="planClarifyData?.round || 0"
+          :total-rounds="planClarifyData?.totalRounds || 3"
+          @answer="handleClarifyAnswer"
+          @close="handleClarifyClose"
+        />
       </template>
     </main>
   </div>
@@ -75,10 +89,11 @@ import {
   FolderOpened,
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { chatApi, modelApi, skillApi, metaApi, mcpApi, contextApi, toolsApi } from '../api'
+import { chatApi, modelApi, skillApi, metaApi, mcpApi, contextApi, toolsApi, planApi } from '../api'
 import { useChatSessions } from '../composables/useChatSessions'
 import ChatMessages from '../components/ChatMessages.vue'
 import ChatInput from '../components/ChatInput.vue'
+import PlanClarifyDialog from '../components/PlanClarifyDialog.vue'
 
 
 // openSettingsDialog 由 App.vue 通过 provide/inject 暴露，用于 /memory 命令跳转
@@ -119,6 +134,10 @@ function getSessionState(sid) {
       lastFailedPrompt: '',
       requestController: null,
       _loaded: false,  // 是否已从后端加载过历史
+      // Plan Mode 相关
+      planMode: false,            // 当前会话是否开启 Plan 模式
+      planClarifyVisible: false,   // 提问弹窗是否可见
+      planClarifyData: null,       // 提问数据 {questions, round, totalRounds, clarifyId}
     }
   }
   return sid ? sessionStates[sid] : null
@@ -131,6 +150,11 @@ const sending = computed(() => getSessionState(activeSession.value)?.sending ?? 
 const streamingReply = computed(() => getSessionState(activeSession.value)?.streamingReply ?? '')
 const streamingReasoning = computed(() => getSessionState(activeSession.value)?.streamingReasoning ?? '')
 const errorState = computed(() => getSessionState(activeSession.value)?.errorState ?? null)
+
+// Plan Mode 相关状态（始终指向当前活跃会话）
+const planMode = computed(() => getSessionState(activeSession.value)?.planMode ?? false)
+const planClarifyVisible = computed(() => getSessionState(activeSession.value)?.planClarifyVisible ?? false)
+const planClarifyData = computed(() => getSessionState(activeSession.value)?.planClarifyData ?? null)
 
 // lastFailedPrompt 保留为普通 ref（非会话相关 UI 态）
 // sendMessage 中会同步写入会话槽，retryLast 从当前槽读取
@@ -189,6 +213,7 @@ async function handleCreateProject() {
 const TOP_COMMANDS = [
   { name: 'model',   label: '/model',   desc: '切换模型',   action: 'expand' },
   { name: 'new',     label: '/new',      desc: '新建会话',   action: 'direct' },
+  { name: 'plan',    label: '/plan',     desc: '计划模式',   action: 'direct' },
   { name: 'compact', label: '/compact',  desc: '压缩上下文', action: 'direct' },
   { name: 'skill',   label: '/skill',    desc: '查看技能与工具', action: 'direct' },
   { name: 'memory',  label: '/memory',   desc: '打开记忆管理', action: 'direct' },
@@ -360,6 +385,39 @@ async function quickStart(text) {
 async function sendMessage(text) {
   const prompt = String(text || '').trim()
   if (!prompt || sending.value) return
+
+  // 拦截 /plan 命令文本：/plan xxx → 开启 Plan 模式并发送任务
+  // /plan（无参数）→ 仅切换 Plan 模式
+  if (prompt === '/plan') {
+    if (!activeSession.value) {
+      const s = await createSession('新会话')
+      selectSession(s.id)
+    }
+    const st = getSessionState(activeSession.value)
+    if (st) {
+      st.planMode = !st.planMode
+      if (st.planMode) {
+        ElMessage.success('计划模式已开启，发送消息后 Agent 将先提问再规划')
+      } else {
+        ElMessage.info('计划模式已关闭')
+      }
+    }
+    return
+  }
+  if (prompt.startsWith('/plan ')) {
+    const taskText = prompt.slice(6).trim()
+    if (!activeSession.value) {
+      const s = await createSession('新会话')
+      selectSession(s.id)
+    }
+    const st2 = getSessionState(activeSession.value)
+    st2.planMode = true
+    if (taskText) {
+      return sendMessage(taskText)
+    }
+    return
+  }
+
   if (!activeSession.value) {
     const s = await createSession('新会话')
     selectSession(s.id)
@@ -386,6 +444,7 @@ async function sendMessage(text) {
       session_id: targetSid,
       message: prompt,
       model: selectedModel.value || undefined,
+      plan_mode: st.planMode || undefined,
     }, { signal: controller.signal })
 
     for await (const { type, data } of stream) {
@@ -474,6 +533,52 @@ async function sendMessage(text) {
           cmd: data.cmd,
           confirmed: false,
         })
+      } else if (type === 'plan_clarify') {
+        // Plan Mode 提问阶段：弹出提问弹窗
+        flushStreamingReply(st)
+        st.planClarifyVisible = true
+        st.planClarifyData = {
+          questions: data.questions || [],
+          round: data.round || 0,
+          totalRounds: data.total_rounds || 3,
+          clarifyId: data.clarify_id,
+        }
+      } else if (type === 'plan_generated') {
+        // Plan Mode 规划阶段：渲染计划卡片
+        flushStreamingReply(st)
+        st.messages.push({
+          role: 'plan',
+          planId: data.plan_id,
+          steps: data.steps || [],
+          planText: data.plan_text || '',
+          confirmed: false,
+          cancelled: false,
+          completed: false,
+          currentStep: -1,
+        })
+      } else if (type === 'plan_step_start') {
+        // 执行阶段：标记步骤开始，刷入上一步的流式文本
+        flushStreamingReply(st)
+        updatePlanStep(st, data.step, 'running')
+      } else if (type === 'plan_step_done') {
+        // 执行阶段：标记步骤完成，刷入本步的流式文本
+        flushStreamingReply(st)
+        updatePlanStep(st, data.step, data.success ? 'done' : 'failed')
+      } else if (type === 'plan_complete') {
+        // 执行阶段：计划全部完成
+        flushStreamingReply(st)
+        finalizePlan(st, 'complete')
+      } else if (type === 'plan_cancelled') {
+        // 执行阶段：计划中止
+        flushStreamingReply(st)
+        finalizePlan(st, 'cancelled', data.step)
+      } else if (type === 'reply') {
+        // Plan Mode 执行阶段中间回复：刷入流式文本作为独立消息
+        if (st.streamingReply.trim()) {
+          flushStreamingReply(st)
+        } else if (data.content && data.content.trim()) {
+          st.messages.push({ role: 'assistant', content: data.content })
+        }
       } else if (type === 'cancelled') {
         markLastToolEventsInterrupted(st, '任务已停止。')
         flushStreamingReply(st)
@@ -580,6 +685,7 @@ async function handleCommand(cmd) {
 
   switch (name) {
     case 'new':     return await cmdNew()
+    case 'plan':    return await cmdPlan()
     case 'compact': return await cmdCompact()
     case 'skill':   return await cmdSkill()
     case 'memory':  return await cmdMemory()
@@ -594,6 +700,18 @@ async function cmdNew() {
   selectSession(s.id)
   // 新会话槽由 getSessionState 自动初始化为空，无需手动清空
   ElMessage.success('已新建会话')
+}
+
+// /plan — 开启计划模式（可选带任务文本直接提交）
+async function cmdPlan() {
+  const st = getSessionState(activeSession.value)
+  if (!st) return
+  st.planMode = !st.planMode
+  if (st.planMode) {
+    ElMessage.success('计划模式已开启，发送消息后 Agent 将先提问再规划')
+  } else {
+    ElMessage.info('计划模式已关闭')
+  }
 }
 
 // /compact — 压缩上下文，结果内联展示到聊天流
@@ -689,6 +807,7 @@ function cmdHelp() {
     `可用命令:\n` +
     `  /model    切换模型\n` +
     `  /new      新建会话\n` +
+    `  /plan     计划模式（先提问再规划，确认后执行）\n` +
     `  /compact  压缩上下文\n` +
     `  /skill    查看技能与工具\n` +
     `  /memory   打开记忆管理\n` +
@@ -718,6 +837,125 @@ async function handleToolConfirm(confirmId, approved) {
     await toolsApi.confirm(confirmId, approved)
   } catch {
     // 确认请求可能已过期，静默处理
+  }
+}
+
+// ========== Plan Mode 相关方法 ==========
+
+function togglePlanMode() {
+  const st = getSessionState(activeSession.value)
+  if (!st) return
+  st.planMode = !st.planMode
+  if (st.planMode) {
+    ElMessage.success('计划模式已开启')
+  } else {
+    ElMessage.info('计划模式已关闭')
+  }
+}
+
+async function handleClarifyAnswer(answers) {
+  const st = getSessionState(activeSession.value)
+  if (!st?.planClarifyData) return
+  try {
+    await planApi.clarifyAnswer({
+      clarify_id: st.planClarifyData.clarifyId,
+      session_id: activeSession.value,
+      answers,
+    })
+  } catch {
+    // 请求可能已过期，静默处理
+  }
+  st.planClarifyVisible = false
+  st.planClarifyData = null
+}
+
+async function handleClarifyClose() {
+  const st = getSessionState(activeSession.value)
+  if (!st?.planClarifyData) return
+  // 跳过所有未回答的问题 → 提交空答案
+  const emptyAnswers = (st.planClarifyData.questions || []).map(q => ({
+    question_id: q.id || '',
+    question: q.question || '',
+    answer: '',
+    skipped: true,
+  }))
+  try {
+    await planApi.clarifyAnswer({
+      clarify_id: st.planClarifyData.clarifyId,
+      session_id: activeSession.value,
+      answers: emptyAnswers,
+    })
+  } catch {
+    // 静默处理
+  }
+  st.planClarifyVisible = false
+  st.planClarifyData = null
+}
+
+async function handlePlanExecute(planId) {
+  const st = getSessionState(activeSession.value)
+  try {
+    await planApi.execute({ plan_id: planId, session_id: activeSession.value })
+  } catch {
+    // 静默处理
+  }
+  if (st) {
+    for (const m of st.messages) {
+      if (m.role === 'plan' && m.planId === planId) {
+        m.confirmed = true
+        m.currentStep = 0
+        break
+      }
+    }
+  }
+}
+
+async function handlePlanCancel(planId) {
+  const st = getSessionState(activeSession.value)
+  try {
+    await planApi.cancel({ plan_id: planId, session_id: activeSession.value })
+  } catch {
+    // 静默处理
+  }
+  if (st) {
+    for (const m of st.messages) {
+      if (m.role === 'plan' && m.planId === planId) {
+        m.confirmed = true
+        m.cancelled = true
+        m.completed = true
+        break
+      }
+    }
+  }
+}
+
+function updatePlanStep(st, stepIdx, status) {
+  if (!st) return
+  for (const m of st.messages) {
+    if (m.role === 'plan' && m.confirmed && !m.cancelled) {
+      m.currentStep = stepIdx
+      if (m.steps[stepIdx]) m.steps[stepIdx].status = status
+      break
+    }
+  }
+}
+
+function finalizePlan(st, result, failedStep) {
+  if (!st) return
+  for (const m of st.messages) {
+    if (m.role === 'plan' && m.confirmed) {
+      if (result === 'cancelled' && failedStep !== undefined) {
+        if (m.steps[failedStep]) m.steps[failedStep].status = 'failed'
+        for (let i = failedStep + 1; i < m.steps.length; i++) {
+          if (!m.steps[i].status || m.steps[i].status === 'pending') {
+            m.steps[i].status = 'cancelled'
+          }
+        }
+        m.cancelled = true
+      }
+      m.completed = true
+      break
+    }
   }
 }
 
