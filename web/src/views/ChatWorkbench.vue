@@ -85,7 +85,7 @@
 <script setup>
 import { ref, reactive, computed, watch, onMounted, onUnmounted, inject } from 'vue'
 import {
-  MagicStick, Document, DataAnalysis, ChatLineRound,
+  MagicStick, Document, Cpu, ChatLineRound,
   FolderOpened,
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
@@ -260,10 +260,10 @@ function onSlashFilter(val) {
 
 // 欢迎屏建议提示词
 const suggestions = [
-  { title: '日常对话', text: '帮我写一段关于人工智能未来发展的短文', icon: ChatLineRound },
-  { title: '创意写作', text: '请给我讲一个关于时间旅行的故事', icon: MagicStick },
-  { title: '文档分析', text: '帮我总结这段文字的核心要点', icon: Document },
-  { title: '数据分析', text: '请用表格对比几种常用排序算法的复杂度', icon: DataAnalysis },
+  { title: '日常对话', text: '帮我搜索一下最近 AI 行业的热点新闻', icon: ChatLineRound },
+  { title: '创意写作', text: '帮我写一份产品发布会的开场致辞', icon: MagicStick },
+  { title: '文档分析', text: '帮我提炼这段文字的核心观点，并列出要点', icon: Document },
+  { title: '编程助手', text: '帮我用 Python 写一个快速排序，并解释', icon: Cpu },
 ]
 
 watch(activeSession, async (id) => {
