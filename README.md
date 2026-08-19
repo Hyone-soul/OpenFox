@@ -10,7 +10,8 @@
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
 
-<img width="1200" height="800" alt="image" src="https://github.com/user-attachments/assets/545477d7-5222-40c8-befa-0d4db543c862" />
+<img width="1200" height="750" alt="image" src="https://github.com/user-attachments/assets/d625f1a1-0ee4-42bb-956f-9aa828a94f11" />
+
 
 
 ---
