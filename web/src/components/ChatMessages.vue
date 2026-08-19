@@ -107,6 +107,51 @@
           </div>
         </div>
       </div>
+
+      <!-- Plan Mode 计划卡片 -->
+      <div v-else-if="m.role === 'plan'" class="msg-row assistant">
+        <div v-if="messageShowAvatar[i]" class="msg-avatar ai-avatar">
+          <img src="/OpenFox.png" class="avatar-img" alt="OpenFox" />
+        </div>
+        <div v-else class="msg-avatar-spacer"></div>
+        <div class="msg-body">
+          <div class="msg-meta" v-if="messageShowAvatar[i]">
+            <span class="msg-name">{{ agentName || 'OpenFox' }}</span>
+            <span class="msg-status">执行计划</span>
+          </div>
+          <div class="plan-card">
+            <div class="plan-card-header">
+              <span class="plan-card-icon">≡</span>
+              <span class="plan-card-title">执行计划</span>
+              <span v-if="m.completed" class="plan-card-badge" :class="m.cancelled ? 'badge-failed' : 'badge-done'">
+                {{ m.cancelled ? '已中止' : '已完成' }}
+              </span>
+              <span v-else-if="m.confirmed && !m.cancelled" class="plan-card-badge badge-running">执行中</span>
+            </div>
+            <div class="plan-steps">
+              <div
+                v-for="(step, si) in m.steps"
+                :key="si"
+                class="plan-step"
+                :class="planStepClass(step, si, m)"
+              >
+                <span class="plan-step-num">
+                  <template v-if="step.status === 'done'">&#10003;</template>
+                  <template v-else-if="step.status === 'failed'">&#10007;</template>
+                  <template v-else-if="step.status === 'cancelled'">&ndash;</template>
+                  <template v-else>{{ si + 1 }}</template>
+                </span>
+                <span class="plan-step-title">{{ step.title }}</span>
+                <span class="plan-step-status">{{ planStepStatusText(step, si, m) }}</span>
+              </div>
+            </div>
+            <div v-if="!m.confirmed && !m.completed" class="plan-actions">
+              <button class="plan-btn plan-execute-btn" @click="$emit('planExecute', m.planId)">执行计划</button>
+              <button class="plan-btn plan-cancel-btn" @click="$emit('planCancel', m.planId)">取消</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </template>
 
     <!-- 请求失败：错误与重试操作直接留在消息流中 -->
@@ -195,7 +240,7 @@ const props = defineProps({
   errorState: { type: Object, default: null },
 })
 
-const emit = defineEmits(['retry', 'openSettings', 'toolConfirm'])
+const emit = defineEmits(['retry', 'openSettings', 'toolConfirm', 'planExecute', 'planCancel'])
 
 // 思考过程折叠状态
 const reasoningCollapsed = ref({})
@@ -291,6 +336,24 @@ function toggleReasoning(key) {
 function isReasoningCollapsed(key) {
   // 默认折叠
   return reasoningCollapsed.value[key] !== false
+}
+
+// ── Plan Mode 计划卡片辅助函数 ──
+function planStepClass(step, si, m) {
+  // 确认后按进度计算状态
+  if (m.confirmed || m.completed) {
+    const status = step.status || (si < (m.currentStep ?? -1) ? 'done' : 'pending')
+    if (si === m.currentStep && !m.completed && status === 'running') return 'step-running'
+    return `step-${status}`
+  }
+  return 'step-pending'
+}
+
+function planStepStatusText(step, si, m) {
+  if (!m.confirmed && !m.completed) return ''
+  const status = step.status || (si < (m.currentStep ?? -1) ? 'done' : 'pending')
+  const map = { running: '执行中...', done: '已完成', failed: '失败', cancelled: '已取消', pending: '待执行' }
+  return map[status] || ''
 }
 
 function formatTime(ts) {
@@ -549,4 +612,141 @@ watch(
   background: #fff; color: #64748b; border-color: #e2e8f0;
 }
 .confirm-deny:hover { background: #f8fafc; }
+
+/* Plan Mode 计划卡片 */
+.plan-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px 16px;
+  max-width: 560px;
+}
+.plan-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.plan-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  background: #1e293b;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.plan-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1e293b;
+}
+.plan-card-badge {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+.badge-running {
+  background: #f1f5f9;
+  color: #64748b;
+}
+.badge-done {
+  background: #ecfdf5;
+  color: #059669;
+}
+.badge-failed {
+  background: #fef2f2;
+  color: #dc2626;
+}
+.plan-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.plan-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  transition: background 0.15s;
+}
+.plan-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #e2e8f0;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.plan-step-title {
+  flex: 1;
+  color: #334155;
+}
+.plan-step-status {
+  font-size: 11px;
+  color: #94a3b8;
+}
+/* 步骤状态样式 */
+.step-pending .plan-step-num { background: #e2e8f0; color: #94a3b8; }
+.step-pending .plan-step-title { color: #94a3b8; }
+.step-running {
+  background: #f1f5f9;
+}
+.step-running .plan-step-num {
+  background: #1e293b;
+  color: #fff;
+  animation: plan-pulse 1.5s infinite;
+}
+.step-running .plan-step-title { color: #1e293b; font-weight: 500; }
+.step-running .plan-step-status { color: #64748b; font-weight: 500; }
+.step-done .plan-step-num { background: #ecfdf5; color: #059669; }
+.step-done .plan-step-title { color: #64748b; text-decoration: line-through; text-decoration-color: #cbd5e1; }
+.step-failed .plan-step-num { background: #fef2f2; color: #dc2626; }
+.step-failed .plan-step-title { color: #dc2626; }
+.step-cancelled .plan-step-num { background: #f1f5f9; color: #94a3b8; }
+.step-cancelled .plan-step-title { color: #94a3b8; text-decoration: line-through; }
+@keyframes plan-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.plan-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+.plan-btn {
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid;
+  transition: all 0.15s;
+}
+.plan-execute-btn {
+  background: #1e293b;
+  color: #fff;
+  border-color: #1e293b;
+}
+.plan-execute-btn:hover { background: #334155; }
+.plan-cancel-btn {
+  background: #fff;
+  color: #64748b;
+  border-color: #e2e8f0;
+}
+.plan-cancel-btn:hover { background: #f8fafc; color: #475569; }
 </style>

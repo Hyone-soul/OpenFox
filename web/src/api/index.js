@@ -226,3 +226,9 @@ export const toolsApi = {
   list: () => http.get('/tools').then(r => r.data),
   confirm: (confirmId, approved) => http.post('/tool/confirm', { confirm_id: confirmId, approved }).then(r => r.data),
 }
+
+export const planApi = {
+  execute: (data) => http.post('/plan/execute', data).then(r => r.data),
+  cancel: (data) => http.post('/plan/cancel', data).then(r => r.data),
+  clarifyAnswer: (data) => http.post('/plan/clarify/answer', data).then(r => r.data),
+}

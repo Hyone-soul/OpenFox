@@ -20,7 +20,7 @@
 
       <!-- 底部工具栏 -->
       <div class="input-toolbar">
-        <!-- 左侧：项目选择器 -->
+        <!-- 左侧：项目选择器 + Plan 模式开关 -->
         <div class="toolbar-left">
           <div class="project-selector">
             <button class="project-tag" @click="projectMenuOpen = !projectMenuOpen">
@@ -48,6 +48,19 @@
               </div>
             </div>
           </div>
+          <!-- Plan 模式切换 -->
+          <button
+            class="mode-toggle-btn"
+            :class="{ active: planMode }"
+            @click="$emit('toggle-plan-mode')"
+            :title="planMode ? '计划模式已开启：点击关闭' : '开启计划模式：先提问再规划，确认后执行'"
+          >
+            <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+              <path d="M3 3.5L5 5.5L11 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M3 7.5h8M3 10.5h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+            <span v-if="planMode" class="mode-label">计划</span>
+          </button>
         </div>
 
         <!-- 右侧：模型标识 + 字数 + 发送 -->
@@ -125,8 +138,10 @@ const props = defineProps({
   currentValue: { type: String, default: '' },
   /** 命令面板是否禁用 filterText 过滤（展开子列表时为 true） */
   slashDisableFilter: { type: Boolean, default: false },
+  /** Plan 模式是否激活 */
+  planMode: { type: Boolean, default: false },
 })
-const emit = defineEmits(['send', 'stop', 'update:modelValue', 'command', 'slash-filter', 'select-project', 'create-project'])
+const emit = defineEmits(['send', 'stop', 'update:modelValue', 'command', 'slash-filter', 'select-project', 'create-project', 'toggle-plan-mode'])
 
 const text = ref('')
 const isFocused = ref(false)
@@ -438,6 +453,41 @@ onUnmounted(() => {
 .project-dropdown-action:hover .el-icon {
   color: #fff;
 }
+
+/* Plan 模式切换按钮 */
+.mode-toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-size: 12px;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+.mode-toggle-btn:hover {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #64748b;
+}
+.mode-toggle-btn.active {
+  background: #1e293b;
+  color: #fff;
+  border-color: #1e293b;
+}
+.mode-toggle-btn.active:hover {
+  background: #334155;
+  color: #fff;
+}
+.mode-label {
+  font-weight: 500;
+  font-size: 11px;
+}
+
 .toolbar-right {
   display: flex;
   align-items: center;

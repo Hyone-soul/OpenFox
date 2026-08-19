@@ -91,6 +91,68 @@ VIBE_CODING_PROMPT = """
 5. 工具调用失败 → 按错误前缀（本地工具异常 / MCP 连接失败 / MCP 调用失败）给出排查建议
 """
 
+# Plan Mode 只读工具白名单：Clarify 和 Plan 阶段仅允许调用这些工具。
+# 写工具（write_file、edit_file、run_shell 写命令等）仅在 Execute 阶段可用。
+# MCP 和自定义工具默认归为写工具（保守策略）。
+READONLY_TOOL_NAMES = frozenset({
+    "read_file", "grep_search", "glob_find", "list_dir",
+    "git_status", "git_diff", "git_log",
+    "ast_parse", "web_search", "web_fetch",
+    "todo_read", "list_sheets", "read_excel",
+    "read_process", "list_processes",
+})
+
+
+# Plan Mode 各阶段系统提示
+_CLARIFY_SYSTEM_PROMPT = """## 计划模式 — 提问阶段
+
+你正处于 Plan Mode 的提问阶段。你的任务是：
+1. 使用只读工具（read_file、grep_search、glob_find、list_dir 等）调研项目结构和代码
+2. 基于调研结果，提出 1-3 个关键的澄清问题来理解用户需求
+
+提问规则：
+- 每轮提出 1-3 个问题，不要一次性问太多
+- 问题应聚焦于影响执行方案的关键决策点（如技术选型、边界条件、优先级等）
+- 可以先用只读工具调研后再提问
+- 使用以下 JSON 格式输出问题（不要输出其他内容）：
+```json
+{
+  "questions": [
+    {
+      "id": "q1",
+      "question": "问题文本",
+      "options": [
+        {"label": "选项A", "description": "选项描述"},
+        {"label": "选项B", "description": "选项描述"}
+      ],
+      "allow_custom": true
+    }
+  ]
+}
+```
+如果已有足够信息、无需提问，输出空 JSON：`{"questions": []}`
+"""
+
+_PLAN_SYSTEM_PROMPT = """## 计划模式 — 规划阶段
+
+基于以上对话和调研结果，生成一个结构化执行计划。使用以下 JSON 格式输出：
+```json
+{
+  "steps": [
+    {
+      "title": "步骤标题（简短）",
+      "action": "详细执行说明（Agent 将按此说明执行该步骤）"
+    }
+  ]
+}
+```
+规则：
+- 每个步骤应是一个可独立执行的原子任务
+- 步骤顺序应当合理（依赖关系正确）
+- action 字段要具体到 Agent 可以直接执行（包含文件路径、函数名等细节）
+- 通常 3-8 个步骤为宜
+"""
+
 
 @dataclass
 class AgentLoop:
@@ -127,8 +189,26 @@ class AgentLoop:
     last_compression_result: CompressionResult | None = None
     # 当前执行步数（供 on_chunk/on_tool_event 回调标记归属，前端按 step 穿插展示）
     current_step: int = 0
+    # ── Plan Mode 相关 ──
+    # 是否开启 Plan Mode（提问→规划→执行 三阶段）
+    plan_mode: bool = False
+    # Plan 事件回调：推送 plan 相关事件后等待用户响应
+    # 签名: async on_plan_event(event_type: str, data: dict) -> str
+    # event_type: "plan_clarify" | "plan_generated" | "plan_step_start" |
+    #             "plan_step_done" | "plan_complete" | "plan_cancelled"
+    # 返回值: 对于 plan_clarify 返回 JSON answers 字符串；
+    #         对于 plan_generated 返回 "execute" | "cancel"；
+    #         其余事件返回空字符串
+    on_plan_event: Callable[[str, dict], Awaitable[str]] | None = None
+    # 内部状态（不应由外部设置）
+    _plan_phase: str = field(default="none", repr=False)  # "clarify"|"plan"|"execute"|"none"
+    _plan_steps: list = field(default_factory=list, repr=False)
+    _plan_current_step: int = field(default=0, repr=False)
+    _plan_id_counter: int = field(default=0, repr=False)
 
     async def run(self, user_input: str) -> str:
+        if self.plan_mode:
+            return await self._run_plan_mode(user_input)
         self.tool_trace.clear()
         self.accumulated_usage = UsageInfo()  # 每次运行重置
         self.current_step = 0
@@ -585,6 +665,550 @@ class AgentLoop:
             self.last_context_snapshot = snapshot
             return snapshot
         return None
+
+    # ========== Plan Mode 三阶段实现 ==========
+
+    async def _run_plan_mode(self, user_input: str) -> str:
+        """Plan Mode 入口：Clarify → Plan → Execute 三阶段。"""
+        self.tool_trace.clear()
+        self.accumulated_usage = UsageInfo()
+        self.current_step = 0
+
+        if self.memory_manager is not None:
+            self.memory_manager.register_turn()
+
+        self._ensure_fresh_system()
+        self.session.add_message("user", user_input)
+
+        # Clarify 阶段
+        await self._clarify_phase()
+
+        # Plan 阶段
+        approved = await self._generate_plan()
+        if not approved:
+            self._plan_phase = "none"
+            return "计划已取消"
+
+        # Execute 阶段
+        result = await self._execute_phase()
+        self._plan_phase = "none"
+        return result
+
+    async def _clarify_phase(self) -> None:
+        """提问阶段：Agent 用只读工具调研，分阶段提澄清问题（最多 3 轮）。"""
+        self._plan_phase = "clarify"
+        # 注入 Clarify 系统提示
+        self.session.add_raw({
+            "role": "system",
+            "content": _CLARIFY_SYSTEM_PROMPT,
+            "_meta": {"plan_clarify": True},
+        })
+
+        max_rounds = 3
+        for round_idx in range(max_rounds):
+            # 用只读工具子集调 LLM
+            assistant = await self._call_llm_plan(stream=True, readonly_only=True)
+            self.accumulated_usage += assistant.usage
+
+            # 处理 tool_calls：Agent 用只读工具调研
+            if assistant.tool_calls:
+                # 先保存含 tool_calls 的 assistant 消息
+                tool_call_msg: dict = {
+                    "role": "assistant",
+                    "content": assistant.content or "",
+                    "tool_calls": [
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.name, "arguments": json.dumps(tc.args, ensure_ascii=False)}}
+                        for tc in assistant.tool_calls
+                    ],
+                }
+                if assistant.reasoning_content:
+                    tool_call_msg["reasoning_content"] = assistant.reasoning_content
+                self.session.add_raw(tool_call_msg)
+
+                # 执行工具调用（只读模式）
+                for _tc_idx, tc in enumerate(assistant.tool_calls):
+                    # 先推送 tool_call 事件（前端显示"运行中"态）
+                    _tc_id = tc.id or f"clarify-{self.current_step}-{_tc_idx}"
+                    if self.on_tool_event is not None:
+                        await self.on_tool_event("tool_call", {
+                            "id": _tc_id, "step": self.current_step,
+                            "name": tc.name, "args": tc.args,
+                        })
+                    result = await self._dispatch(tc)
+                    result_text = _result_text(result)
+                    self.tool_trace.append({
+                        "name": tc.name, "args": tc.args, "result": result_text,
+                    })
+                    self.session.add_raw({
+                        "role": "tool", "tool_call_id": tc.id, "content": result_text,
+                    })
+                    # 推送 tool_result 事件
+                    if self.on_tool_event is not None:
+                        await self.on_tool_event("tool_result", {
+                            "id": _tc_id, "step": self.current_step,
+                            "name": tc.name, "args": tc.args,
+                            "result": result_text,
+                            "success": isinstance(result, ToolResult) and result.success,
+                            "elapsed": 0,
+                        })
+                self.current_step += 1
+                # 继续本轮循环：LLM 可能再次调研或开始提问
+                continue
+
+            # 无 tool_calls：解析问题
+            if not assistant.content or not assistant.content.strip():
+                break
+
+            questions = self._parse_clarify_questions(assistant.content)
+            # 保存 assistant 提问消息
+            msg: dict = {"role": "assistant", "content": assistant.content}
+            if assistant.reasoning_content:
+                msg["reasoning_content"] = assistant.reasoning_content
+            self.session.add_raw(msg)
+
+            if not questions:
+                # Agent 认为无需提问，结束 Clarify
+                break
+
+            # 推送问题到前端，等待回答
+            self._plan_id_counter += 1
+            clarify_id = f"clarify-{self._plan_id_counter}-{round_idx}"
+            answers_raw = await self.on_plan_event("plan_clarify", {
+                "clarify_id": clarify_id,
+                "round": round_idx,
+                "total_rounds": max_rounds,
+                "questions": questions,
+            })
+
+            # answers_raw 是 JSON 字符串（来自 Future.set_result）
+            if not answers_raw:
+                # 用户关闭弹窗 = 跳过所有
+                break
+
+            try:
+                answers = json.loads(answers_raw) if isinstance(answers_raw, str) else answers_raw
+            except json.JSONDecodeError:
+                answers = []
+
+            # 把回答注入会话作为 user 消息
+            answer_parts = []
+            for ans in answers:
+                q_id = ans.get("question_id", "")
+                q_text = ans.get("question", "")
+                a_text = ans.get("answer", "")
+                skipped = ans.get("skipped", False)
+                if skipped:
+                    answer_parts.append(f"Q: {q_text}\nA: （跳过）")
+                else:
+                    answer_parts.append(f"Q: {q_text}\nA: {a_text}")
+            self.session.add_message("user", "\n\n".join(answer_parts) if answer_parts else "（无补充信息）")
+
+        # 清理 Clarify 系统提示
+        self._strip_plan_system_messages()
+
+    async def _generate_plan(self) -> bool:
+        """规划阶段：生成结构化执行计划，等待用户确认。返回 True=执行，False=取消。"""
+        self._plan_phase = "plan"
+        self.session.add_raw({
+            "role": "system",
+            "content": _PLAN_SYSTEM_PROMPT,
+            "_meta": {"plan_gen": True},
+        })
+
+        assistant = await self._call_llm_plan(stream=True, readonly_only=False)
+        self.accumulated_usage += assistant.usage
+
+        # 如果 LLM 先用工具调研，循环执行直到返回纯文本计划
+        plan_guard = 0
+        while assistant.tool_calls and plan_guard < 5:
+            plan_guard += 1
+            tool_call_msg: dict = {
+                "role": "assistant",
+                "content": assistant.content or "",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.name, "arguments": json.dumps(tc.args, ensure_ascii=False)}}
+                    for tc in assistant.tool_calls
+                ],
+            }
+            if assistant.reasoning_content:
+                tool_call_msg["reasoning_content"] = assistant.reasoning_content
+            self.session.add_raw(tool_call_msg)
+
+            for _tc_idx, tc in enumerate(assistant.tool_calls):
+                _tc_id = tc.id or f"plan-research-{plan_guard}-{_tc_idx}"
+                if self.on_tool_event is not None:
+                    await self.on_tool_event("tool_call", {
+                        "id": _tc_id, "step": self.current_step,
+                        "name": tc.name, "args": tc.args,
+                    })
+                result = await self._dispatch(tc)
+                result_text = _result_text(result)
+                self.session.add_raw({
+                    "role": "tool", "tool_call_id": tc.id, "content": result_text,
+                })
+                if self.on_tool_event is not None:
+                    await self.on_tool_event("tool_result", {
+                        "id": _tc_id, "step": self.current_step,
+                        "name": tc.name, "args": tc.args,
+                        "result": result_text,
+                        "success": isinstance(result, ToolResult) and result.success,
+                        "elapsed": 0,
+                    })
+            self.current_step += 1
+            # 再调一次 LLM 看是否产出纯文本计划
+            assistant = await self._call_llm_plan(stream=True, readonly_only=False)
+            self.accumulated_usage += assistant.usage
+
+        # 保存计划文本到会话
+        msg: dict = {"role": "assistant", "content": assistant.content or ""}
+        if assistant.reasoning_content:
+            msg["reasoning_content"] = assistant.reasoning_content
+        self.session.add_raw(msg)
+
+        # 解析计划步骤
+        self._plan_steps = self._parse_plan_steps(assistant.content or "")
+
+        # 推送计划到前端
+        self._plan_id_counter += 1
+        plan_id = f"plan-{self._plan_id_counter}"
+        if self.on_plan_event is not None:
+            decision = await self.on_plan_event("plan_generated", {
+                "plan_id": plan_id,
+                "steps": self._plan_steps,
+                "plan_text": assistant.content or "",
+            })
+            # 清理 Plan 系统提示
+            self._strip_plan_system_messages()
+            return decision == "execute"
+
+        # 无回调时默认取消
+        self._strip_plan_system_messages()
+        return False
+
+    async def _execute_phase(self) -> str:
+        """执行阶段：逐步执行计划，某步失败即中止。"""
+        self._plan_phase = "execute"
+
+        for idx, step in enumerate(self._plan_steps):
+            self._plan_current_step = idx
+            step_title = step.get("title", f"步骤 {idx + 1}")
+            step_action = step.get("action", "")
+
+            # 推送步骤开始
+            if self.on_plan_event is not None:
+                await self.on_plan_event("plan_step_start", {
+                    "step": idx,
+                    "title": step_title,
+                    "action": step_action,
+                })
+
+            # 注入步骤指令并执行
+            step_instruction = (
+                f"请执行计划第 {idx + 1} 步：{step_title}\n"
+                f"执行说明：{step_action}"
+            )
+            self.session.add_message("user", step_instruction)
+
+            # 运行单步 Agent 循环（步数偏移=计划步骤索引*100，防止不同步骤工具卡片合并）
+            success = await self._run_step_loop(max_steps=20, step_offset=idx * 100)
+
+            # 推送步骤完成
+            if self.on_plan_event is not None:
+                await self.on_plan_event("plan_step_done", {
+                    "step": idx,
+                    "success": success,
+                })
+
+            if not success:
+                # 失败中止
+                if self.on_plan_event is not None:
+                    await self.on_plan_event("plan_cancelled", {
+                        "step": idx,
+                        "reason": f"步骤 {idx + 1}（{step_title}）执行失败",
+                    })
+                return f"计划在第 {idx + 1} 步（{step_title}）失败，已中止"
+
+        # 全部完成
+        if self.on_plan_event is not None:
+            await self.on_plan_event("plan_complete", {
+                "total_steps": len(self._plan_steps),
+            })
+        self.session.save()
+        return f"计划已全部执行完成（共 {len(self._plan_steps)} 步）"
+
+    async def _run_step_loop(self, max_steps: int = 20, step_offset: int = 0) -> bool:
+        """单步 Agent 循环：执行一个计划步骤，返回是否成功。
+
+        复用现有 run() 的内层循环逻辑，但限制最大步数且不触发标题生成。
+        step_offset：工具事件中 step 值的偏移量，防止不同计划步骤的工具卡片合并。
+        """
+        consecutive_failures = 0
+        MAX_CONSEC = 3
+        for step in range(max_steps):
+            self.current_step = step_offset + step
+
+            # Preflight 压缩检查
+            if self.compressor is not None:
+                should_compress, snapshot = self.compressor.should_compress(
+                    messages=self.session.chat_messages(),
+                    tool_schemas=self.registry.list_tool_schemas(),
+                    model_name=self._get_model_name(),
+                )
+                self.last_context_snapshot = snapshot
+                if should_compress:
+                    compressed_msgs, result = await self.compressor.compress(
+                        messages=self.session.get_messages(),
+                        tool_schemas=self.registry.list_tool_schemas(),
+                        model_name=self._get_model_name(),
+                    )
+                    self.last_compression_result = result
+                    if result.success:
+                        self.session.set_messages(compressed_msgs)
+
+            assistant = await self._call_llm(stream=True)
+            self.accumulated_usage += assistant.usage
+
+            if not assistant.tool_calls:
+                # 终态回复
+                msg: dict = {"role": "assistant", "content": assistant.content or ""}
+                if assistant.reasoning_content:
+                    msg["reasoning_content"] = assistant.reasoning_content
+                self.session.add_raw(msg)
+                self.session.save()
+                if self.on_tool_event is not None:
+                    await self.on_tool_event("reply", {"content": assistant.content or ""})
+                return True
+
+            # 追加 assistant 消息（含 tool_calls）
+            tool_call_msg: dict = {
+                "role": "assistant",
+                "content": assistant.content or "",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.name, "arguments": json.dumps(tc.args, ensure_ascii=False)}}
+                    for tc in assistant.tool_calls
+                ],
+            }
+            if assistant.reasoning_content:
+                tool_call_msg["reasoning_content"] = assistant.reasoning_content
+            self.session.add_raw(tool_call_msg)
+
+            step_all_failed = True
+            for _tc_idx, tc in enumerate(assistant.tool_calls):
+                _tool_start = time.monotonic()
+                if self.on_tool_event is not None:
+                    await self.on_tool_event("tool_call", {
+                        "id": tc.id or f"plan-{self._plan_current_step}-{step}-{_tc_idx}",
+                        "step": self.current_step,
+                        "name": tc.name,
+                        "args": tc.args,
+                    })
+
+                result = await self._dispatch(tc)
+
+                # 危险命令确认（复用现有机制）
+                if isinstance(result, ToolResult) and result.confirm_required:
+                    confirm_id = f"confirm-plan-{self.current_step}-{_tc_idx}"
+                    if self.on_tool_event is not None:
+                        await self.on_tool_event("tool_confirm", {
+                            "id": confirm_id, "step": self.current_step,
+                            "name": tc.name, "args": tc.args, "cmd": result.confirm_cmd,
+                        })
+                    if self.on_confirm is not None:
+                        approved = await self.on_confirm(confirm_id)
+                    else:
+                        approved = False
+                    if approved:
+                        tc_args = dict(tc.args)
+                        tc_args["_confirmed"] = True
+                        confirmed_tc = ToolCall(id=tc.id, name=tc.name, args=tc_args)
+                        result = await self._dispatch(confirmed_tc)
+                    else:
+                        result = ToolResult(
+                            success=False,
+                            error=f"用户拒绝了危险命令：{result.confirm_cmd}",
+                        )
+
+                _tool_elapsed = time.monotonic() - _tool_start
+                result_text = _result_text(result)
+                self.tool_trace.append({
+                    "name": tc.name, "args": tc.args, "result": result_text,
+                })
+                if self.on_tool_event is not None:
+                    await self.on_tool_event("tool_result", {
+                        "id": tc.id or f"plan-{self._plan_current_step}-{step}-{_tc_idx}",
+                        "step": self.current_step,
+                        "name": tc.name, "args": tc.args,
+                        "result": result_text,
+                        "success": isinstance(result, ToolResult) and result.success,
+                        "elapsed": round(_tool_elapsed, 2),
+                    })
+                self.session.add_raw({
+                    "role": "tool", "tool_call_id": tc.id, "content": result_text,
+                })
+                if isinstance(result, ToolResult) and result.success:
+                    step_all_failed = False
+
+            if step_all_failed:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSEC:
+                    return False
+            else:
+                consecutive_failures = 0
+
+        # 达到单步最大循环数但未得到终态回复 → 视为失败
+        self.session.add_raw({
+            "role": "system",
+            "content": f"步骤 {self._plan_current_step + 1} 达到最大工具调用次数（{max_steps}），未完成。",
+        })
+        self.session.save()
+        return False
+
+    async def _call_llm_plan(self, stream: bool, readonly_only: bool) -> AssistantMessage:
+        """Plan Mode 专用 LLM 调用：可过滤为只读工具子集。"""
+        messages = self.session.chat_messages()
+        messages = self._sanitize_tool_calls(messages)
+        tools = self._filter_tool_schemas(readonly_only=readonly_only)
+        if not stream:
+            return await self.adapter.chat(
+                messages, tools=tools, stream=False, temperature=self.temperature,
+            )
+        # 流式
+        chunks_iter = self.adapter.stream_chat(
+            messages, tools=tools, temperature=self.temperature,
+        )
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tc_groups: dict[int, dict] = {}
+        async for chunk in chunks_iter:
+            self.accumulated_usage += chunk.usage
+            if self.on_chunk is not None:
+                await self.on_chunk(chunk)
+            if chunk.content_delta:
+                content_parts.append(chunk.content_delta)
+            if chunk.reasoning_delta:
+                reasoning_parts.append(chunk.reasoning_delta)
+            if chunk.tool_call_delta is not None:
+                idx = chunk.tool_call_index if chunk.tool_call_index >= 0 else 0
+                if idx not in tc_groups:
+                    tc_groups[idx] = {"id": "", "name": "", "args_parts": []}
+                if chunk.tool_call_delta.id:
+                    tc_groups[idx]["id"] = chunk.tool_call_delta.id
+                if chunk.tool_call_delta.name:
+                    tc_groups[idx]["name"] = chunk.tool_call_delta.name
+            if chunk.tool_call_args_delta:
+                idx = chunk.tool_call_index if chunk.tool_call_index >= 0 else 0
+                if idx not in tc_groups:
+                    tc_groups[idx] = {"id": "", "name": "", "args_parts": []}
+                tc_groups[idx]["args_parts"].append(chunk.tool_call_args_delta)
+
+        content = "".join(content_parts)
+        reasoning_content = "".join(reasoning_parts)
+        tool_calls: list[ToolCall] = []
+        for idx in sorted(tc_groups.keys()):
+            g = tc_groups[idx]
+            if not g["name"] and not g["args_parts"]:
+                continue
+            args_str = "".join(g["args_parts"]).strip()
+            try:
+                args = json.loads(args_str) if args_str else {}
+            except json.JSONDecodeError:
+                args = {}
+            tool_calls.append(ToolCall(id=g["id"], name=g["name"], args=args))
+        return AssistantMessage(
+            content=content, tool_calls=tool_calls,
+            usage=UsageInfo(), reasoning_content=reasoning_content,
+        )
+
+    def _filter_tool_schemas(self, readonly_only: bool) -> list[dict]:
+        """过滤工具 schema：readonly_only=True 时仅返回只读工具。"""
+        all_schemas = self.registry.list_tool_schemas()
+        if not readonly_only:
+            return all_schemas
+        filtered = []
+        for s in all_schemas:
+            name = s.get("function", {}).get("name", "")
+            if name in READONLY_TOOL_NAMES:
+                filtered.append(s)
+        return filtered
+
+    @staticmethod
+    def _parse_clarify_questions(text: str) -> list[dict]:
+        """从 LLM 输出解析 JSON 格式的澄清问题列表。"""
+        # 尝试从文本中提取 JSON 块
+        json_str = text.strip()
+        # 如果被 ```json ... ``` 包裹
+        if "```json" in json_str:
+            start = json_str.find("```json") + 7
+            end = json_str.find("```", start)
+            if end > start:
+                json_str = json_str[start:end].strip()
+        elif "```" in json_str:
+            start = json_str.find("```") + 3
+            end = json_str.find("```", start)
+            if end > start:
+                json_str = json_str[start:end].strip()
+        try:
+            data = json.loads(json_str)
+            questions = data.get("questions", []) if isinstance(data, dict) else []
+            # 校验格式
+            valid = []
+            for q in questions:
+                if isinstance(q, dict) and q.get("question"):
+                    if not q.get("id"):
+                        q["id"] = f"q{len(valid) + 1}"
+                    if not isinstance(q.get("options"), list):
+                        q["options"] = []
+                    q.setdefault("allow_custom", False)
+                    valid.append(q)
+            return valid
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Clarify 问题解析失败，原始文本: %s", text[:200])
+            return []
+
+    @staticmethod
+    def _parse_plan_steps(text: str) -> list[dict]:
+        """从 LLM 输出解析 JSON 格式的执行计划步骤列表。"""
+        json_str = text.strip()
+        if "```json" in json_str:
+            start = json_str.find("```json") + 7
+            end = json_str.find("```", start)
+            if end > start:
+                json_str = json_str[start:end].strip()
+        elif "```" in json_str:
+            start = json_str.find("```") + 3
+            end = json_str.find("```", start)
+            if end > start:
+                json_str = json_str[start:end].strip()
+        try:
+            data = json.loads(json_str)
+            steps = data.get("steps", []) if isinstance(data, dict) else []
+            valid = []
+            for s in steps:
+                if isinstance(s, dict) and s.get("title"):
+                    s.setdefault("action", "")
+                    valid.append(s)
+            return valid
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Plan 步骤解析失败，原始文本: %s", text[:200])
+            # 降级：把整段文本作为单步
+            return [{"title": "执行任务", "action": text.strip()}]
+
+    def _strip_plan_system_messages(self) -> None:
+        """清理 Plan Mode 注入的临时系统提示消息。"""
+        messages = self.session.get_messages()
+        cleaned = [
+            m for m in messages
+            if not (
+                m.get("role") == "system"
+                and isinstance(m.get("_meta"), dict)
+                and (m["_meta"].get("plan_clarify") or m["_meta"].get("plan_gen"))
+            )
+        ]
+        if len(cleaned) != len(messages):
+            self.session.set_messages(cleaned)
 
 
 def _result_text(result) -> str:
